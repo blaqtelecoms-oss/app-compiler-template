@@ -1,0 +1,36 @@
+name: Build Mobile App
+
+on:
+  repository_dispatch:
+    types: [build_app]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install Expo CLI & EAS CLI
+        run: npm install -g expo-cli eas-cli
+
+      - name: Install Project Dependencies
+        run: npm install
+
+      - name: Inject User Link & Configuration
+        run: |
+          echo '{ "url": "${{ github.event.client_payload.target_url }}", "appName": "${{ github.event.client_payload.app_name }}" }' > config.json
+          
+      - name: Build APK locally (Android)
+        run: eas build --platform android --profile preview --local --non-interactive
+
+      - name: Handle Artifact Output
+        run: |
+          echo "Build finished successfully!"
+          # Add script here to upload your built .apk file to cloud storage (like AWS S3 or Supabase) 
+          # and dispatch a webhook back to your Base44 backend with the final download link.
