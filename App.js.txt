@@ -1,0 +1,41 @@
+import React, { useState, useEffect } from 'react';
+import { StyleSheet, View, SafeAreaView, ActivityIndicator } from 'react-native';
+import { WebView } from 'react-native-webview';
+
+export default function App() {
+  const [targetUrl, setTargetUrl] = useState('https://google.com');
+
+  useEffect(() => {
+    try {
+      const config = require('./config.json');
+      if (config && config.url) {
+        setTargetUrl(config.url);
+      }
+    } catch (e) {
+      // Fallback if config is missing
+    }
+  }, []);
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <WebView 
+        source={{ uri: targetUrl }} 
+        style={styles.webview}
+        javaScriptEnabled={true}
+        domStorageEnabled={true}
+        startInLoadingState={true}
+        renderLoading={() => (
+          <View style={styles.loader}>
+            <ActivityIndicator size="large" color="#0000ff" />
+          </View>
+        )}
+      />
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#ffffff' },
+  webview: { flex: 1 },
+  loader: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, justifyContent: 'center', alignItems: 'center' }
+});
