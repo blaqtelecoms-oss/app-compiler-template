@@ -1,36 +1,121 @@
-name: Build Mobile App
+name: Build mobile app
 
 on:
   repository_dispatch:
-    types: [build_app]
+    types: [myapps-build, build_app]
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  android:
+    if: github.event.client_payload.platform != 'ios'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout template
         uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: '20'
 
-      - name: Install Expo CLI & EAS CLI
-        run: npm install -g expo-cli eas-cli
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
 
-      - name: Install Project Dependencies
-        run: npm install
-
-      - name: Inject User Link & Configuration
+      - name: Create the native wrapper
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
-          echo '{ "url": "${{ github.event.client_payload.target_url }}", "appName": "${{ github.event.client_payload.app_name }}" }' > config.json
-          
-      - name: Build APK locally (Android)
-        run: eas build --platform android --profile preview --local --non-interactive
+          mkdir -p wrapper/www
+          cat > wrapper/www/index.html <<'HTML'
+          <!doctype html>
+          <html>
+            <head><meta charset="utf-8"><title>Loading</title></head>
+            <body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui,sans-serif">
+              <p>Loading&hellip;</p>
+            </body>
+          </html>
+          HTML
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(process.env.PAYLOAD || "{}");
+            const slug = String(p.app_name || "myapp").toLowerCase().replace(/[^a-z0-9]+/g, "") || "app";
+            const appId = p.package_name || ("com.myapps." + slug);
+            fs.writeFileSync("wrapper/package.json", JSON.stringify({
+              name: "myapps-wrapper",
+              private: true,
+              devDependencies: { "@capacitor/cli": "^7.0.0" },
+              dependencies: { "@capacitor/core": "^7.0.0", "@capacitor/android": "^7.0.0" }
+            }, null, 2));
+            fs.writeFileSync("wrapper/capacitor.config.json", JSON.stringify({
+              appId: appId,
+              appName: p.app_name || "My App",
+              webDir: "www",
+              backgroundColor: p.theme_color || "#4F46E5",
+              server: { url: p.website_url, cleartext: false },
+              android: { backgroundColor: p.theme_color || "#4F46E5" }
+            }, null, 2));
+          '
 
-      - name: Handle Artifact Output
+      - name: Generate the Android project
+        working-directory: wrapper
         run: |
-          echo "Build finished successfully!"
-          # Add script here to upload your built .apk file to cloud storage (like AWS S3 or Supabase) 
-          # and dispatch a webhook back to your Base44 backend with the final download link.
+          npm install --no-audit --no-fund
+          npx cap add android
+          npx cap sync android
+
+      - name: Compile the APK
+        working-directory: wrapper/android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Publish the APK as a public release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+        run: |
+          cp wrapper/android/app/build/outputs/apk/debug/app-debug.apk app.apk
+          gh release create "build-$BUILD_ID" app.apk --title "Build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "build-$BUILD_ID" app.apk --clobber
+          echo "APK_URL=https://github.com/${{ github.repository }}/releases/download/build-$BUILD_ID/app.apk" >> "$GITHUB_ENV"
+
+      - name: Tell MyApps the build succeeded
+        if: success()
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+        run: |
+          curl -sS -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: $WEBHOOK_SECRET" \
+            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"success\",\"artifact_url\":\"$APK_URL\"}"
+
+      - name: Tell MyApps the build failed
+        if: failure()
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+        run: |
+          curl -sS -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: $WEBHOOK_SECRET" \
+            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"message\":\"The compiler runner failed - open the Actions log for this run.\"}"
+
+  ios:
+    if: github.event.client_payload.platform == 'ios'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report that iOS signing is not configured
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+        run: |
+          curl -sS -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: $WEBHOOK_SECRET" \
+            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"message\":\"iOS builds need an Apple Developer certificate and a macOS runner. Add signing to the template repo, then build again.\"}"
