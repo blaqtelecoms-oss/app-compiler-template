@@ -61,7 +61,7 @@ jobs:
               webDir: "www",
               backgroundColor: "#FFFFFF",
               server: { url: p.website_url, cleartext: false },
-              android: { backgroundColor: "#FFFFFF",
+              android: { backgroundColor: "#FFFFFF"},
               plugins: {
                 SplashScreen: {
                   launchShowDuration: 1200,
