@@ -97,8 +97,8 @@ jobs:
             keytool -genkeypair -keystore keystore/debug.keystore -storepass android -keypass android \
               -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
-            git add keystore/debug.keystore
-            git -c user.name=myapps-bot -c user.email=builds@myapps.local commit -m "Store the app signing key so updates install over each other" >/dev/null
+            git add -f keystore/debug.keystore
+            git -c user.name=myapps-bot -c user.email=builds@myapps.local commit -m "Store the app signing key so updates install over each other" >/dev/null || true
             git push origin "HEAD:${{ github.event.repository.default_branch }}" || echo "::warning::Could not store the signing key in the repository."
           fi
           cp keystore/debug.keystore "$HOME/.android/debug.keystore"
