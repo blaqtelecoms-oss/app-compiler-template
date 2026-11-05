@@ -59,14 +59,14 @@ jobs:
               appId: appId,
               appName: p.app_name || "My App",
               webDir: "www",
-              backgroundColor: p.theme_color || "#4F46E5",
+              backgroundColor: "#FFFFFF",
               server: { url: p.website_url, cleartext: false },
-              android: { backgroundColor: p.theme_color || "#4F46E5" },
+              android: { backgroundColor: "#FFFFFF",
               plugins: {
                 SplashScreen: {
                   launchShowDuration: 1200,
                   launchAutoHide: true,
-                  backgroundColor: p.theme_color || "#4F46E5",
+                  backgroundColor: "#FFFFFF",
                   androidSplashResourceName: "splash",
                   androidScaleType: "CENTER_CROP",
                   showSpinner: false,
