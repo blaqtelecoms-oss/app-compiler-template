@@ -49,7 +49,11 @@ jobs:
               name: "myapps-wrapper",
               private: true,
               devDependencies: { "@capacitor/cli": "^7.0.0" },
-              dependencies: { "@capacitor/core": "^7.0.0", "@capacitor/android": "^7.0.0" }
+              dependencies: {
+                "@capacitor/core": "^7.0.0",
+                "@capacitor/android": "^7.0.0",
+                "@capacitor/splash-screen": "^7.0.0"
+              }
             }, null, 2));
             fs.writeFileSync("wrapper/capacitor.config.json", JSON.stringify({
               appId: appId,
@@ -57,7 +61,19 @@ jobs:
               webDir: "www",
               backgroundColor: p.theme_color || "#4F46E5",
               server: { url: p.website_url, cleartext: false },
-              android: { backgroundColor: p.theme_color || "#4F46E5" }
+              android: { backgroundColor: p.theme_color || "#4F46E5" },
+              plugins: {
+                SplashScreen: {
+                  launchShowDuration: 1200,
+                  launchAutoHide: true,
+                  backgroundColor: p.theme_color || "#4F46E5",
+                  androidSplashResourceName: "splash",
+                  androidScaleType: "CENTER_CROP",
+                  showSpinner: false,
+                  splashFullScreen: true,
+                  splashImmersive: false
+                }
+              }
             }, null, 2));
           '
 
@@ -67,6 +83,66 @@ jobs:
           npm install --no-audit --no-fund
           npx cap add android
           npx cap sync android
+
+      # Each app ships its own icon and splash screen. Both are public uploads
+      # from the project, so they can be fetched straight into the native assets.
+      - name: Apply the app icon and splash screen
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          APP_ICON_URL=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.logo_url||""')
+          APP_SPLASH_URL=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.splash_screen_url||""')
+
+          if [ -z "$APP_ICON_URL" ] && [ -z "$APP_SPLASH_URL" ]; then
+            echo "This app has no uploaded icon or splash screen - keeping the template artwork."
+            exit 0
+          fi
+
+          command -v convert >/dev/null || { sudo apt-get update -qq; sudo apt-get install -y imagemagick; }
+          RES=wrapper/android/app/src/main/res
+
+          if [ -n "$APP_ICON_URL" ]; then
+            if curl -sSL --fail "$APP_ICON_URL" -o /tmp/app-icon.png; then
+              echo "Applying the uploaded app icon"
+              # An adaptive icon would keep the template foreground, so plain PNGs are used.
+              rm -rf "$RES/mipmap-anydpi-v26"
+              for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+                density=${pair%%:*}
+                size=${pair##*:}
+                mkdir -p "$RES/mipmap-$density"
+                convert /tmp/app-icon.png -background none -gravity center \
+                  -resize "${size}x${size}^" -extent "${size}x${size}" -strip \
+                  "PNG32:$RES/mipmap-$density/ic_launcher.png"
+                cp "$RES/mipmap-$density/ic_launcher.png" "$RES/mipmap-$density/ic_launcher_round.png"
+              done
+            else
+              echo "::warning::The app icon could not be downloaded - keeping the template icon."
+            fi
+          fi
+
+          if [ -n "$APP_SPLASH_URL" ]; then
+            if curl -sSL --fail "$APP_SPLASH_URL" -o /tmp/app-splash.png; then
+              echo "Applying the uploaded splash screen"
+              splash() {
+                mkdir -p "$RES/$1"
+                convert /tmp/app-splash.png -gravity center -resize "$2x$3^" -extent "$2x$3" -strip \
+                  "PNG32:$RES/$1/splash.png"
+              }
+              splash drawable 1080 1920
+              splash drawable-port-mdpi 320 480
+              splash drawable-port-hdpi 480 800
+              splash drawable-port-xhdpi 720 1280
+              splash drawable-port-xxhdpi 960 1600
+              splash drawable-port-xxxhdpi 1280 1920
+              splash drawable-land-mdpi 480 320
+              splash drawable-land-hdpi 800 480
+              splash drawable-land-xhdpi 1280 720
+              splash drawable-land-xxhdpi 1600 960
+              splash drawable-land-xxxhdpi 1920 1280
+            else
+              echo "::warning::The splash screen could not be downloaded - keeping the template splash."
+            fi
+          fi
 
       - name: Compile the APK
         working-directory: wrapper/android
@@ -91,7 +167,7 @@ jobs:
           curl -sS -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
             -H "x-webhook-secret: $WEBHOOK_SECRET" \
-            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"success\",\"artifact_url\":\"$APK_URL\"}"
+            -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"status\":\"success\",\"artifact_url\":\"$APK_URL\"}"
 
       - name: Tell MyApps the build failed
         if: failure()
@@ -103,7 +179,7 @@ jobs:
           curl -sS -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
             -H "x-webhook-secret: $WEBHOOK_SECRET" \
-            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"message\":\"The compiler runner failed - open the Actions log for this run.\"}"
+            -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"message\":\"The compiler runner failed - open the Actions log for this run.\"}"
 
   ios:
     if: github.event.client_payload.platform == 'ios'
@@ -118,4 +194,4 @@ jobs:
           curl -sS -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
             -H "x-webhook-secret: $WEBHOOK_SECRET" \
-            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"message\":\"iOS builds need an Apple Developer certificate and a macOS runner. Add signing to the template repo, then build again.\"}"
+            -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"message\":\"iOS builds need an Apple Developer certificate and a macOS runner. Add signing to the template repo, then build again.\"}"
