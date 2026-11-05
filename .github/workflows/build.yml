@@ -89,6 +89,29 @@ jobs:
 
       # Each app ships its own icon and splash screen. Both are public uploads
       # from the project, so they can be fetched straight into the native assets.
+      - name: Keep the same signing key for updates
+        working-directory: wrapper
+        run: |
+          mkdir -p "$HOME/.android" keystore
+          if [ ! -f keystore/debug.keystore ]; then
+            keytool -genkeypair -keystore keystore/debug.keystore -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            git add keystore/debug.keystore
+            git -c user.name=myapps-bot -c user.email=builds@myapps.local commit -m "Store the app signing key so updates install over each other" >/dev/null
+            git push origin "HEAD:${{ github.event.repository.default_branch }}" || echo "::warning::Could not store the signing key in the repository."
+          fi
+          cp keystore/debug.keystore "$HOME/.android/debug.keystore"
+          echo "Signing key ready - updates install over the previous build."
+      - name: Stamp the app version
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          VERSION_NAME=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.version_name||"1.0.0"')
+          VERSION_CODE=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.version_code||1')
+          sed -i -E "s/versionName \"[^\"]*\"/versionName \"$VERSION_NAME\"/; s/versionCode [0-9]+/versionCode $VERSION_CODE/" wrapper/android/app/build.gradle
+          echo "Stamped version $VERSION_NAME (build $VERSION_CODE)"
+          grep -E "versionName|versionCode" wrapper/android/app/build.gradle
       - name: Apply the app icon and splash screen
         env:
           PAYLOAD: ${{ toJson(github.event.client_payload) }}
