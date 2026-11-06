@@ -295,9 +295,6 @@ jobs:
                   -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
                 if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
               fi
-              for candidate in dist out build .next/out .output/public site _site public www; do
-                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
-              done
               return 1
             }
 
@@ -594,9 +591,6 @@ jobs:
                   -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
                 if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
               fi
-              for candidate in dist out build .next/out .output/public site _site public www; do
-                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
-              done
               return 1
             }
 
