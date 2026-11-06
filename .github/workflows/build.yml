@@ -792,6 +792,301 @@ jobs:
           PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
           node /tmp/myapps-verify-mobile.cjs "$PLATFORM"
 
+      - name: Add the Android TV wrapper
+        if: github.event.client_payload.platform == 'android_tv'
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/myapps-tv-runtime.js <<'MYAPPS_SCRIPT'
+          (function () {
+            if (window.__MYAPPS_TV__) return;
+            window.__MYAPPS_TV__ = true;
+          
+            var FOCUSABLE = [
+              'a[href]',
+              'button:not([disabled])',
+              'input:not([disabled])',
+              'select:not([disabled])',
+              'textarea:not([disabled])',
+              '[tabindex]:not([tabindex="-1"])',
+              '[role="button"]',
+              '[role="link"]',
+              '[contenteditable="true"]'
+            ].join(',');
+          
+            var CSS = [
+              'html[data-myapps-tv]{--myapps-tv-focus:#818cf8;}',
+              'html[data-myapps-tv] body{overflow-x:hidden;}',
+              'html[data-myapps-tv] :focus{outline:3px solid var(--myapps-tv-focus)!important;outline-offset:3px!important;}',
+              'html[data-myapps-tv] a,html[data-myapps-tv] button,html[data-myapps-tv] [role="button"]{transition:transform .14s ease,box-shadow .14s ease;}',
+              'html[data-myapps-tv] a:focus,html[data-myapps-tv] button:focus,html[data-myapps-tv] [role="button"]:focus{transform:scale(1.04);}',
+              'html[data-myapps-tv] input,html[data-myapps-tv] select,html[data-myapps-tv] textarea{font-size:1.05em;}',
+              'html[data-myapps-tv] ::-webkit-scrollbar{width:10px;height:10px;}'
+            ].join('\n');
+          
+            function installStyles() {
+              if (document.getElementById('myapps-tv-style')) return;
+              var style = document.createElement('style');
+              style.id = 'myapps-tv-style';
+              style.textContent = CSS;
+              (document.head || document.documentElement).appendChild(style);
+            }
+          
+            function isVisible(element) {
+              var rect = element.getBoundingClientRect();
+              if (rect.width < 2 || rect.height < 2) return false;
+              var computed = window.getComputedStyle(element);
+              return computed.visibility !== 'hidden' && computed.display !== 'none' && computed.opacity !== '0';
+            }
+          
+            function focusable() {
+              return Array.prototype.slice.call(document.querySelectorAll(FOCUSABLE)).filter(isVisible);
+            }
+          
+            function current() {
+              var element = document.activeElement;
+              return element && element !== document.body && element !== document.documentElement ? element : null;
+            }
+          
+            function focusElement(element) {
+              if (!element || typeof element.focus !== 'function') return;
+              element.focus({ preventScroll: true });
+              if (element.scrollIntoView) {
+                element.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+              }
+            }
+          
+            // Nearest neighbour in the pressed direction, so the remote never dead-ends.
+            function move(direction) {
+              var list = focusable();
+              if (!list.length) return;
+              var from = current() || list[0];
+              var box = from.getBoundingClientRect();
+              var cx = box.left + box.width / 2;
+              var cy = box.top + box.height / 2;
+              var best = null;
+              var bestScore = Infinity;
+              for (var i = 0; i < list.length; i++) {
+                var element = list[i];
+                if (element === from) continue;
+                var rect = element.getBoundingClientRect();
+                var dx = rect.left + rect.width / 2 - cx;
+                var dy = rect.top + rect.height / 2 - cy;
+                var forward = direction === 'left' ? -dx : direction === 'right' ? dx : direction === 'up' ? -dy : dy;
+                if (forward <= 4) continue;
+                var sideways = direction === 'left' || direction === 'right' ? Math.abs(dy) : Math.abs(dx);
+                var score = forward + sideways * 2;
+                if (score < bestScore) {
+                  bestScore = score;
+                  best = element;
+                }
+              }
+              if (!best) best = list[(list.indexOf(from) + 1) % list.length];
+              focusElement(best);
+            }
+          
+            function isTyping(element) {
+              if (!element) return false;
+              var tag = element.tagName;
+              return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || element.isContentEditable;
+            }
+          
+            document.addEventListener('keydown', function (event) {
+              var key = event.key;
+              if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+              if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown') {
+                event.preventDefault();
+                move(key === 'ArrowLeft' ? 'left' : key === 'ArrowRight' ? 'right' : key === 'ArrowUp' ? 'up' : 'down');
+                return;
+              }
+              // The select button arrives as Enter on a TV remote.
+              if (key === 'Enter') {
+                var active = current();
+                if (!active || isTyping(active)) return;
+                var native = active.tagName === 'A' || active.tagName === 'BUTTON' || active.tagName === 'INPUT';
+                if (!native && typeof active.click === 'function') {
+                  event.preventDefault();
+                  active.click();
+                }
+                return;
+              }
+              if (key === 'Escape' || key === 'GoBack' || key === 'BrowserBack' || key === 'Backspace') {
+                if (key === 'Backspace' && isTyping(current())) return;
+                if (window.history.length > 1) {
+                  event.preventDefault();
+                  window.history.back();
+                }
+              }
+            }, true);
+          
+            function start() {
+              installStyles();
+              document.documentElement.setAttribute('data-myapps-tv', 'true');
+              // Chrome only paints a focus ring after a key press; a remote-first app needs one straight away.
+              window.setTimeout(function () {
+                if (!current()) focusElement(focusable()[0]);
+              }, 600);
+            }
+          
+            if (document.readyState === 'complete') start();
+            else window.addEventListener('load', start);
+          })();
+          MYAPPS_SCRIPT
+          cat > /tmp/myapps-apply-tv.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const zlib = require('zlib');
+          const path = require('path');
+          const { execFileSync } = require('child_process');
+          
+          const payload = JSON.parse(process.env.PAYLOAD || '{}');
+          const config = payload.app_config || {};
+          const WEB = 'wrapper/www';
+          const MAIN = 'wrapper/android/app/src/main';
+          const RES = path.join(MAIN, 'res/drawable-xhdpi');
+          
+          function crc32(buffer) {
+            const table = [];
+            for (let n = 0; n < 256; n++) {
+              let c = n;
+              for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+              table[n] = c >>> 0;
+            }
+            let crc = 0xffffffff;
+            for (let i = 0; i < buffer.length; i++) crc = table[(crc ^ buffer[i]) & 0xff] ^ (crc >>> 8);
+            return (crc ^ 0xffffffff) >>> 0;
+          }
+          
+          function chunk(type, data) {
+            const length = Buffer.alloc(4);
+            length.writeUInt32BE(data.length, 0);
+            const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+            const sum = Buffer.alloc(4);
+            sum.writeUInt32BE(crc32(body), 0);
+            return Buffer.concat([length, body, sum]);
+          }
+          
+          // A plain banner keeps the launcher valid when no icon was uploaded.
+          function solidBanner(width, height, hex) {
+            const parts = String(hex || '#4F46E5').replace('#', '').match(/../g) || ['4F', '46', 'E5'];
+            const rgb = parts.slice(0, 3).map((value) => parseInt(value, 16) || 0);
+            const raw = Buffer.alloc((width * 3 + 1) * height);
+            for (let y = 0; y < height; y++) {
+              const row = y * (width * 3 + 1);
+              for (let x = 0; x < width; x++) {
+                const at = row + 1 + x * 3;
+                raw[at] = rgb[0];
+                raw[at + 1] = rgb[1];
+                raw[at + 2] = rgb[2];
+              }
+            }
+            const header = Buffer.alloc(13);
+            header.writeUInt32BE(width, 0);
+            header.writeUInt32BE(height, 4);
+            header[8] = 8;
+            header[9] = 2;
+            return Buffer.concat([
+              Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+              chunk('IHDR', header),
+              chunk('IDAT', zlib.deflateSync(raw)),
+              chunk('IEND', Buffer.alloc(0)),
+            ]);
+          }
+          
+          function writeBanner(target, logoUrl, themeColor) {
+            if (logoUrl) {
+              try {
+                execFileSync('curl', ['-sSL', '--fail', logoUrl, '-o', '/tmp/myapps-tv-logo.png'], { stdio: 'inherit' });
+                execFileSync(
+                  'convert',
+                  ['/tmp/myapps-tv-logo.png', '-background', 'none', '-gravity', 'center', '-resize', '320x180^', '-extent', '320x180', '-strip', 'PNG32:' + target],
+                  { stdio: 'inherit' }
+                );
+                return 'logo';
+              } catch (error) {
+                console.log('::warning::The app icon could not be used for the TV banner - using a plain banner.');
+              }
+            }
+            fs.writeFileSync(target, solidBanner(320, 180, themeColor));
+            return 'solid';
+          }
+          
+          // 1. Ship the remote navigation runtime with the bundled site.
+          const runtime = fs.readFileSync('/tmp/myapps-tv-runtime.js', 'utf8');
+          fs.mkdirSync(WEB, { recursive: true });
+          fs.writeFileSync(path.join(WEB, 'myapps-tv.js'), runtime);
+          const indexFile = path.join(WEB, 'index.html');
+          if (!fs.existsSync(indexFile)) throw new Error('The bundled app has no index.html to add TV support to.');
+          let html = fs.readFileSync(indexFile, 'utf8');
+          if (!html.includes('myapps-tv.js')) {
+            const tag = '<script src="myapps-tv.js" defer></script>';
+            html = /<\/head>/i.test(html) ? html.replace(/<\/head>/i, tag + '\n</head>') : tag + '\n' + html;
+            fs.writeFileSync(indexFile, html);
+          }
+          
+          // 2. Leanback discovery and the TV launcher entry in the manifest.
+          const manifestFile = path.join(MAIN, 'AndroidManifest.xml');
+          let manifest = fs.readFileSync(manifestFile, 'utf8');
+          if (!manifest.includes('android.software.leanback')) {
+            const features = [
+              '    <uses-feature android:name="android.software.leanback" android:required="false" />',
+              '    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />',
+            ].join('\n');
+            const open = manifest.indexOf('<manifest');
+            const close = manifest.indexOf('>', open);
+            manifest = manifest.slice(0, close + 1) + '\n' + features + manifest.slice(close + 1);
+          }
+          if (!manifest.includes('android:banner')) {
+            manifest = manifest.replace(/<application\b/, '<application\n        android:banner="@drawable/tv_banner"');
+          }
+          if (!manifest.includes('LEANBACK_LAUNCHER')) {
+            const name = manifest.indexOf('MainActivity');
+            if (name < 0) throw new Error('The generated Android project has no MainActivity.');
+            const close = manifest.indexOf('</activity>', name);
+            if (close < 0) throw new Error('The generated Android project has no activity block to extend.');
+            const filter = [
+              '',
+              '            <intent-filter>',
+              '                <action android:name="android.intent.action.MAIN" />',
+              '                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />',
+              '            </intent-filter>',
+              '        ',
+            ].join('\n');
+            manifest = manifest.slice(0, close) + filter + manifest.slice(close);
+          }
+          fs.writeFileSync(manifestFile, manifest);
+          
+          // 3. A 320x180 launcher banner, which Android TV requires for discovery.
+          fs.mkdirSync(RES, { recursive: true });
+          const banner = writeBanner(path.join(RES, 'tv_banner.png'), String(config.logo_url || ''), String(config.theme_color || '#4F46E5'));
+          console.log('MYAPPS_TV_MANIFEST_PATCHED ' + JSON.stringify({ banner, manifest: true, runtime: true }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-apply-tv.cjs
+          (cd wrapper && npx cap copy android)
+          cat > /tmp/myapps-verify-tv.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const manifest = fs.readFileSync('wrapper/android/app/src/main/AndroidManifest.xml', 'utf8');
+          const assets = 'wrapper/android/app/src/main/assets/public';
+          const html = fs.readFileSync(assets + '/index.html', 'utf8');
+          const checks = {
+            leanback: manifest.includes('android.software.leanback'),
+            touchscreenOptional: /android.hardware.touchscreen"\s+android:required="false"/.test(manifest),
+            bannerAttribute: /android:banner="@drawable\/tv_banner"/.test(manifest),
+            leanbackLauncher: manifest.includes('LEANBACK_LAUNCHER'),
+            banner: fs.existsSync('wrapper/android/app/src/main/res/drawable-xhdpi/tv_banner.png'),
+            runtime: fs.existsSync(assets + '/myapps-tv.js'),
+            entry: html.includes('myapps-tv.js'),
+          };
+          const failed = Object.keys(checks).filter((key) => !checks[key]);
+          if (failed.length) {
+            console.log('::error::The Android TV wrapper is incomplete: ' + failed.join(', '));
+            process.exit(1);
+          }
+          console.log('MYAPPS_TV_WRAPPER_READY ' + JSON.stringify(checks));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-verify-tv.cjs
+
       - name: Compile the APK
         working-directory: wrapper/android
         run: ./gradlew assembleDebug --no-daemon
