@@ -179,36 +179,100 @@ jobs:
           set -euo pipefail
           ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
           if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
-          unpack_codebase() {
-            local dest="$1"
-            local dl="/tmp/myapps-codebase.zip"
-            local work="/tmp/myapps-codebase"
-            command -v curl >/dev/null 2>&1 || { echo "::error::curl is not available."; exit 1; }
-            rm -rf "$work" && mkdir -p "$work"
+          prepare_codebase() {
+            dest="$1"
+            dl="/tmp/myapps-codebase.zip"
+            work="/tmp/myapps-codebase"
+            rm -rf "$work" "$dest"
+            mkdir -p "$work"
+            echo "Downloading the uploaded archive"
             curl -sSL --fail "$ZIP_URL" -o "$dl"
             if [ "${RUNNER_OS:-Linux}" = "Windows" ]; then
-              local dl_win work_win
-              dl_win=$(cygpath -w "$dl")
-              work_win=$(cygpath -w "$work")
-              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$dl_win' -DestinationPath '$work_win' -Force"
+              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$dl")' -DestinationPath '$(cygpath -w "$work")' -Force"
             else
               unzip -q "$dl" -d "$work"
             fi
-            local root="$work"
-            local nested=""
-            if [ ! -f "$root/index.html" ]; then
-              nested=$(find "$work" -maxdepth 3 -name index.html -print -quit)
-              if [ -n "$nested" ]; then root=$(dirname "$nested"); fi
+
+            # The shallowest index.html is the website's entry point.
+            find_entry() {
+              depth=1
+              while [ "$depth" -le 5 ]; do
+                hit=$(find "$1" -mindepth "$depth" -maxdepth "$depth" -name index.html \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit)
+                if [ -n "$hit" ]; then dirname "$hit"; return 0; fi
+                depth=$((depth + 1))
+              done
+              return 1
+            }
+
+            # A project with a build script is a source tree - it has to be compiled.
+            find_project() {
+              if [ -f "$1/package.json" ]; then
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$1/package.json" >/dev/null 2>&1; then
+                  printf '%s' "$1"; return 0
+                fi
+              fi
+              find "$1" -mindepth 2 -maxdepth 3 -name package.json \
+                -not -path '*/node_modules/*' -not -path '*/.git/*' -print > /tmp/myapps-manifests.txt 2>/dev/null || true
+              while read -r manifest; do
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$manifest" >/dev/null 2>&1; then
+                  dirname "$manifest"; return 0
+                fi
+              done < /tmp/myapps-manifests.txt
+              return 1
+            }
+
+            # Where a compiled project puts the files that run in a browser.
+            find_output() {
+              if [ -n "$2" ]; then
+                fresh=$(find "$1" -maxdepth 4 -name index.html -newer "$2" \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
+                if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
+              fi
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
+              return 1
+            }
+
+            root=""
+            project=$(find_project "$work" || true)
+            if [ -n "$project" ]; then
+              echo "Found a source project - running its build command"
+              stamp=/tmp/myapps-build-stamp
+              touch "$stamp"
+              (
+                cd "$project"
+                if [ -f package-lock.json ]; then
+                  npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+                else
+                  npm install --no-audit --no-fund
+                fi
+                npm run build
+              )
+              root=$(find_output "$project" "$stamp" || true)
+              if [ -z "$root" ]; then
+                echo "::warning::The project built, but no site output was found - using the files as uploaded."
+              fi
             fi
-            if [ ! -f "$root/index.html" ]; then
-              echo "::error::The archive does not contain an index.html. Zip the built site with index.html at its root."
+            if [ -z "$root" ]; then root=$(find_entry "$work" || true); fi
+
+            if [ -z "$root" ] || [ ! -f "$root/index.html" ]; then
+              echo "::error::No browser-ready site was found in the archive. Upload a built site with index.html at its root, or a project whose build command produces one."
+              echo "Files found in the archive:"
+              ls -1 "$work" | head -n 15 || true
               exit 1
             fi
-            rm -rf "$dest" && mkdir -p "$dest"
+
+            mkdir -p "$dest"
             cp -R "$root/." "$dest/"
-            echo "Bundled the uploaded codebase from $ZIP_URL"
+            echo "Bundling the site from $(basename "$root")"
+            # Root-absolute paths (src="/assets/app.js") only resolve on a web
+            # server, so they become relative and load from inside the app.
+            node -e "const fs=require('fs'),f=process.argv[1];let s=fs.readFileSync(f,'utf8');s=s.replace(/((?:src|href|poster)=[\"'])\/(?!\/)/g,'\$1');fs.writeFileSync(f,s)" "$dest/index.html"
+            echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
-          unpack_codebase "wrapper/www"
+          prepare_codebase "wrapper/www"
           node -e 'const fs=require("fs");const p="wrapper/capacitor.config.json";if(fs.existsSync(p)){const c=JSON.parse(fs.readFileSync(p,"utf8"));delete c.server;fs.writeFileSync(p,JSON.stringify(c,null,2));}'
           (cd wrapper && npx cap copy android)
           echo "The app ships its own files, so it runs without a connection."
