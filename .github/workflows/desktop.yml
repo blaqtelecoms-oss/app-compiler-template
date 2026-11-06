@@ -246,7 +246,9 @@ jobs:
                 // A stable base is essential when an SPA refreshes a nested route.
                 if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
                 if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
-                text = text.replace(/<head\b[^>]*>/i, '$&<base href="/">');
+                // A replacement function keeps the matched tag intact; "$&" is only a
+                // placeholder, so any text placed around it must never rely on expansion.
+                text = text.replace(/<head\b[^>]*>/i, (tag) => tag + '<base href="/">');
               }
               fs.writeFileSync(file, text);
             }
@@ -700,7 +702,9 @@ jobs:
                 // A stable base is essential when an SPA refreshes a nested route.
                 if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
                 if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
-                text = text.replace(/<head\b[^>]*>/i, '$&<base href="/">');
+                // A replacement function keeps the matched tag intact; "$&" is only a
+                // placeholder, so any text placed around it must never rely on expansion.
+                text = text.replace(/<head\b[^>]*>/i, (tag) => tag + '<base href="/">');
               }
               fs.writeFileSync(file, text);
             }
@@ -1154,7 +1158,9 @@ jobs:
                 // A stable base is essential when an SPA refreshes a nested route.
                 if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
                 if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
-                text = text.replace(/<head\b[^>]*>/i, '$&<base href="/">');
+                // A replacement function keeps the matched tag intact; "$&" is only a
+                // placeholder, so any text placed around it must never rely on expansion.
+                text = text.replace(/<head\b[^>]*>/i, (tag) => tag + '<base href="/">');
               }
               fs.writeFileSync(file, text);
             }
