@@ -1,4 +1,5 @@
 name: Build desktop app
+run-name: "MyApps ${{ github.event.client_payload.build_id }} (${{ github.event.client_payload.platform }})"
 
 on:
   repository_dispatch:
@@ -28,7 +29,7 @@ jobs:
           set -euo pipefail
           mkdir -p desktop/app
           APP_NAME=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); (p.app_name||"Desktop App").slice(0,60)')
-          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url||""')
+          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.build_type==="zip"?"":p.target_url||""')
           SLUG=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); String(p.app_name||"app").toLowerCase().replace(/[^a-z0-9]+/g,"")||"app"')
           cat > desktop/config.json <<JSON
           {
@@ -36,47 +37,139 @@ jobs:
             "appName": "$APP_NAME"
           }
           JSON
+          cat > desktop/local-origin.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const { pathToFileURL } = require('url');
+          const { net } = require('electron');
+          const SCHEME = 'myapps';
+          const ORIGIN = SCHEME + '://localhost/';
+          const privileges = { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true };
+          function installLocalOrigin(localSession, directory) {
+            const root = fs.realpathSync(directory);
+            const inside = (file) => file === root || file.startsWith(root + path.sep);
+            localSession.protocol.handle(SCHEME, async (request) => {
+              const url = new URL(request.url);
+              if (url.host !== 'localhost') return new Response('Forbidden', { status: 403 });
+              if (!['GET', 'HEAD'].includes(request.method)) return new Response('Method not allowed', { status: 405 });
+              let pathname;
+              try { pathname = decodeURIComponent(url.pathname); } catch { return new Response('Bad path', { status: 400 }); }
+              if (pathname.includes('\\') || pathname.includes('\0')) return new Response('Bad path', { status: 400 });
+              let file = path.resolve(root, '.' + pathname);
+              if (!inside(file)) return new Response('Forbidden', { status: 403 });
+              if (fs.existsSync(file) && fs.statSync(file).isDirectory()) file = path.join(file, 'index.html');
+              if (!fs.existsSync(file)) {
+                // Only documents get SPA fallback; missing JS/CSS must remain a real 404.
+                const documentRequest = request.mode === 'navigate' || (request.headers.get('accept') || '').includes('text/html');
+                if (!documentRequest || path.extname(pathname)) return new Response('Not found', { status: 404 });
+                file = path.join(root, 'index.html');
+              }
+              if (!inside(fs.realpathSync(file)) || !fs.statSync(file).isFile()) return new Response('Forbidden', { status: 403 });
+              const response = await net.fetch(pathToFileURL(file).href);
+              const headers = new Headers(response.headers);
+              headers.set('X-Content-Type-Options', 'nosniff');
+              headers.set('Cache-Control', 'no-cache');
+              return new Response(request.method === 'HEAD' ? null : response.body, { status: response.status, headers });
+            });
+          }
+          module.exports = { SCHEME, ORIGIN, privileges, installLocalOrigin };
+          MYAPPS_SCRIPT
+          cat > desktop/verify-bundle.cjs <<'MYAPPS_SCRIPT'
+          module.exports = async function verifyBundle(win, localSession, origin) {
+            const assert = require('assert/strict');
+            const html = await localSession.fetch(origin);
+            assert.equal(html.status, 200);
+            assert.match(html.headers.get('content-type') || '', /text\/html/);
+            const index = await html.text();
+            const deep = await localSession.fetch(origin + '__myapps_probe__/route', { headers: { Accept: 'text/html' } });
+            assert.equal(deep.status, 200);
+            assert.equal(await deep.text(), index, 'SPA document fallback differs from index.html');
+            assert.equal((await localSession.fetch(origin + '__myapps_missing__.js')).status, 404);
+            let checked = 0;
+            for (const tag of index.match(/<(?:script|link)\b[^>]*>/gi) || []) {
+              if (/^<link/i.test(tag) && !/\brel\s*=\s*["'](?:stylesheet|modulepreload)["']/i.test(tag)) continue;
+              const match = tag.match(/\b(?:src|href)\s*=\s*["']([^"']+)["']/i);
+              if (!match) continue;
+              const url = new URL(match[1], origin);
+              if (url.protocol !== 'myapps:') continue;
+              const response = await localSession.fetch(url.href);
+              assert.equal(response.status, 200, 'Entry asset missing: ' + url.href);
+              assert.doesNotMatch(response.headers.get('content-type') || '', /text\/html/);
+              checked++;
+            }
+            await win.loadURL(origin);
+            const waitForContent = async () => {
+              for (let attempt = 0; attempt < 60; attempt++) {
+                const rendered = await win.webContents.executeJavaScript(
+                  '(() => { const b=document.body.cloneNode(true); b.querySelectorAll("script,style,noscript").forEach(n=>n.remove()); return !!(b.textContent.trim() || b.querySelector("img,svg,canvas,video,iframe,input,button")); })()'
+                );
+                if (rendered) return;
+                await new Promise((resolve) => setTimeout(resolve, 250));
+              }
+              throw new Error('The bundled app rendered an empty document after 15 seconds.');
+            };
+            await waitForContent();
+            await win.webContents.executeJavaScript('history.pushState({}, "", "/__myapps_probe__/route")');
+            await Promise.race([
+              new Promise((resolve, reject) => {
+                win.webContents.once('did-finish-load', resolve);
+                win.webContents.once('did-fail-load', (_event, code, message) => reject(new Error(code + ': ' + message)));
+                win.webContents.reload();
+              }),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('SPA reload timed out.')), 20000)),
+            ]);
+            await waitForContent();
+            assert.equal(new URL(win.webContents.getURL()).pathname, '/__myapps_probe__/route');
+            console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ origin, platform: process.platform, level: 'renderer', checked, spaFallback: true, historyReload: true }));
+          };
+          MYAPPS_SCRIPT
           cat > desktop/main.js <<'JS'
-          const { app, BrowserWindow, shell } = require('electron');
+          const { app, BrowserWindow, shell, protocol, session } = require('electron');
           const path = require('path');
           const config = require('./config.json');
-          const origin = config.targetUrl ? new URL(config.targetUrl).origin : '';
-
+          const local = require('./local-origin.cjs');
+          const verifying = process.argv.includes('--verify-local-bundle');
+          protocol.registerSchemesAsPrivileged([{ scheme: local.SCHEME, privileges: local.privileges }]);
+          const startUrl = config.targetUrl || local.ORIGIN;
+          const sameOrigin = (url) => {
+            try { const a = new URL(startUrl), b = new URL(url); return a.protocol === b.protocol && a.host === b.host; }
+            catch { return false; }
+          };
+          let localSession;
           function createWindow() {
             const win = new BrowserWindow({
-              width: 1200,
-              height: 820,
-              minWidth: 760,
-              minHeight: 540,
-              title: config.appName,
-              autoHideMenuBar: true,
-              backgroundColor: '#ffffff',
-              webPreferences: { contextIsolation: true, nodeIntegration: false },
+              width: 1200, height: 820, minWidth: 760, minHeight: 540,
+              title: config.appName, autoHideMenuBar: true, backgroundColor: '#ffffff',
+              show: !verifying,
+              webPreferences: { session: localSession, contextIsolation: true, nodeIntegration: false, sandbox: true },
             });
-            if (config.targetUrl) {
-              win.loadURL(config.targetUrl);
-              win.webContents.on('will-navigate', (event, url) => {
-                if (!url.startsWith(origin)) {
-                  event.preventDefault();
-                  shell.openExternal(url);
-                }
-              });
-            } else {
-              // Codebase build: the site's files are shipped inside the app.
-              win.loadFile(path.join(__dirname, 'app', 'index.html'));
-            }
+            win.webContents.on('will-navigate', (event, url) => {
+              if (!sameOrigin(url)) {
+                event.preventDefault();
+                if (/^https?:/i.test(url)) shell.openExternal(url);
+              }
+            });
             win.webContents.setWindowOpenHandler(({ url }) => {
               if (/^https?:/i.test(url)) shell.openExternal(url);
               return { action: 'deny' };
             });
+            return win;
           }
-
-          app.whenReady().then(createWindow);
-          app.on('window-all-closed', () => {
-            if (process.platform !== 'darwin') app.quit();
-          });
+          app.whenReady().then(async () => {
+            localSession = session.fromPartition(verifying ? 'myapps-verification' : 'persist:myapps');
+            if (!config.targetUrl) {
+              local.installLocalOrigin(localSession, path.join(__dirname, 'app'));
+              console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED ' + local.ORIGIN);
+            }
+            const win = createWindow();
+            if (verifying) {
+              await require('./verify-bundle.cjs')(win, localSession, local.ORIGIN);
+              app.exit(0);
+            } else await win.loadURL(startUrl);
+          }).catch((error) => { console.error(error); app.exit(1); });
+          app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
           app.on('activate', () => {
-            if (BrowserWindow.getAllWindows().length === 0) createWindow();
+            if (localSession && BrowserWindow.getAllWindows().length === 0) createWindow().loadURL(startUrl);
           });
           JS
           cat > desktop/package.json <<JSON
@@ -87,8 +180,8 @@ jobs:
             "main": "main.js",
             "author": "MyApps Convertor",
             "description": "$APP_NAME",
-            "files": ["main.js", "config.json", "app/**/*"],
             "build": {
+              "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "app/**/*"],
               "appId": "com.myapps.$SLUG",
               "productName": "$APP_NAME",
               "directories": { "output": "dist" },
@@ -111,6 +204,68 @@ jobs:
           set -euo pipefail
           ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
           if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
+          cat > /tmp/myapps-normalize-bundle.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          let rewritten = 0;
+          let scanned = 0;
+          function localFile(url) {
+            const pathname = decodeURIComponent(url.split(/[?#]/)[0]);
+            const full = path.resolve(root, '.' + pathname);
+            return full.startsWith(root + path.sep) && fs.existsSync(full) && fs.statSync(full).isFile();
+          }
+          function normalize(url) {
+            // Never rewrite external URLs, API calls, router paths, or computed JS strings.
+            if (!/^\/(?!\/)/.test(url) || !/\.[a-z0-9]{1,8}(?:[?#]|$)/i.test(url)) return url;
+            if (localFile(url)) return url;
+            const segments = url.split('/');
+            for (let i = 2; i < segments.length; i++) {
+              const candidate = '/' + segments.slice(i).join('/');
+              if (localFile(candidate)) { rewritten++; return candidate; }
+            }
+            return url;
+          }
+          function walk(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (entry.isSymbolicLink()) throw new Error('Bundle symlinks are not supported: ' + entry.name);
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory()) { walk(file); continue; }
+              if (!/\.(html|css|[cm]?js)$/i.test(file)) continue;
+              scanned++;
+              let text = fs.readFileSync(file, 'utf8');
+              // Quoted root paths in HTML and JS, and CSS url()/@import references.
+              text = text.replace(/(["'\x60])(\/(?!\/)[^"'\x60\s<>]*?)\1/g,
+                (match, quote, url) => quote + normalize(url) + quote);
+              text = text.replace(/url\(\s*(\/(?!\/)[^\s)'"<>]+)\s*\)/g,
+                (match, url) => 'url(' + normalize(url) + ')');
+              text = text.replace(/(\bsrcset\s*=\s*["'])([^"']+)(["'])/gi,
+                (match, start, values, end) => start + values.replace(/(^|,\s*)(\/[^\s,]+)/g,
+                  (item, gap, url) => gap + normalize(url)) + end);
+              if (file === path.join(root, 'index.html')) {
+                // A stable base is essential when an SPA refreshes a nested route.
+                if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
+                if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
+                text = text.replace(/<head\b[^>]*>/i, '$&<base href="/">');
+              }
+              fs.writeFileSync(file, text);
+            }
+          }
+          walk(root);
+          const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+          let entryAssets = 0;
+          for (const tag of html.match(/<(?:script|link)\b[^>]*>/gi) || []) {
+            if (/^<link/i.test(tag) && !/\brel\s*=\s*["'](?:stylesheet|modulepreload|preload)["']/i.test(tag)) continue;
+            const match = tag.match(/\b(?:src|href)\s*=\s*["']([^"']+)["']/i);
+            if (!match || /^(?:[a-z]+:|\/\/|#)/i.test(match[1])) continue;
+            const url = new URL(match[1], 'https://localhost/');
+            if (/\.(?:tsx?|jsx)$/i.test(url.pathname) || !localFile(url.pathname)) {
+              throw new Error('Missing or uncompiled entry asset: ' + match[1] + '. Upload a browser-ready build.');
+            }
+            entryAssets++;
+          }
+          console.log('MYAPPS_ASSETS_NORMALIZED ' + JSON.stringify({ scanned, rewritten, entryAssets, base: '/' }));
+          MYAPPS_SCRIPT
           prepare_codebase() {
             dest="$1"
             dl="/tmp/myapps-codebase.zip"
@@ -156,14 +311,14 @@ jobs:
 
             # Where a compiled project puts the files that run in a browser.
             find_output() {
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
               if [ -n "$2" ]; then
                 fresh=$(find "$1" -maxdepth 4 -name index.html -newer "$2" \
                   -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
                 if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
               fi
-              for candidate in dist out build .next/out .output/public site _site public www; do
-                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
-              done
               return 1
             }
 
@@ -184,7 +339,8 @@ jobs:
               )
               root=$(find_output "$project" "$stamp" || true)
               if [ -z "$root" ]; then
-                echo "::warning::The project built, but no site output was found - using the files as uploaded."
+                echo "::error::The build did not produce a static site. Export browser-ready output (dist, build or out); a server-only app cannot run offline."
+                exit 1
               fi
             fi
             if [ -z "$root" ]; then root=$(find_entry "$work" || true); fi
@@ -199,9 +355,7 @@ jobs:
             mkdir -p "$dest"
             cp -R "$root/." "$dest/"
             echo "Bundling the site from $(basename "$root")"
-            # Root-absolute paths (src="/assets/app.js") only resolve on a web
-            # server, so they become relative and load from inside the app.
-            node -e "const fs=require('fs'),f=process.argv[1];let s=fs.readFileSync(f,'utf8');s=s.replace(/((?:src|href|poster)=[\"'])\/(?!\/)/g,'\$1');fs.writeFileSync(f,s)" "$dest/index.html"
+            node /tmp/myapps-normalize-bundle.cjs "$dest"
             echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
           prepare_codebase "desktop/app"
@@ -227,12 +381,27 @@ jobs:
             echo "::warning::The app icon could not be downloaded - using the default artwork."
           fi
 
-      - name: Package the installer
+      - name: Install desktop tools
+        shell: bash
+        working-directory: desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Verify the local bundle server
+        if: github.event.client_payload.build_type == 'zip'
         shell: bash
         working-directory: desktop
         run: |
-          npm install --no-audit --no-fund
-          npx electron-builder --win nsis --publish never
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            xvfb-run -a npx electron . --verify-local-bundle
+          else
+            npx electron . --verify-local-bundle
+          fi
+
+      - name: Package the installer
+        shell: bash
+        working-directory: desktop
+        run: npx electron-builder --win nsis --publish never
 
       - name: Publish the installer
         shell: bash
@@ -312,7 +481,7 @@ jobs:
           set -euo pipefail
           mkdir -p desktop/app
           APP_NAME=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); (p.app_name||"Desktop App").slice(0,60)')
-          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url||""')
+          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.build_type==="zip"?"":p.target_url||""')
           SLUG=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); String(p.app_name||"app").toLowerCase().replace(/[^a-z0-9]+/g,"")||"app"')
           cat > desktop/config.json <<JSON
           {
@@ -320,47 +489,139 @@ jobs:
             "appName": "$APP_NAME"
           }
           JSON
+          cat > desktop/local-origin.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const { pathToFileURL } = require('url');
+          const { net } = require('electron');
+          const SCHEME = 'myapps';
+          const ORIGIN = SCHEME + '://localhost/';
+          const privileges = { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true };
+          function installLocalOrigin(localSession, directory) {
+            const root = fs.realpathSync(directory);
+            const inside = (file) => file === root || file.startsWith(root + path.sep);
+            localSession.protocol.handle(SCHEME, async (request) => {
+              const url = new URL(request.url);
+              if (url.host !== 'localhost') return new Response('Forbidden', { status: 403 });
+              if (!['GET', 'HEAD'].includes(request.method)) return new Response('Method not allowed', { status: 405 });
+              let pathname;
+              try { pathname = decodeURIComponent(url.pathname); } catch { return new Response('Bad path', { status: 400 }); }
+              if (pathname.includes('\\') || pathname.includes('\0')) return new Response('Bad path', { status: 400 });
+              let file = path.resolve(root, '.' + pathname);
+              if (!inside(file)) return new Response('Forbidden', { status: 403 });
+              if (fs.existsSync(file) && fs.statSync(file).isDirectory()) file = path.join(file, 'index.html');
+              if (!fs.existsSync(file)) {
+                // Only documents get SPA fallback; missing JS/CSS must remain a real 404.
+                const documentRequest = request.mode === 'navigate' || (request.headers.get('accept') || '').includes('text/html');
+                if (!documentRequest || path.extname(pathname)) return new Response('Not found', { status: 404 });
+                file = path.join(root, 'index.html');
+              }
+              if (!inside(fs.realpathSync(file)) || !fs.statSync(file).isFile()) return new Response('Forbidden', { status: 403 });
+              const response = await net.fetch(pathToFileURL(file).href);
+              const headers = new Headers(response.headers);
+              headers.set('X-Content-Type-Options', 'nosniff');
+              headers.set('Cache-Control', 'no-cache');
+              return new Response(request.method === 'HEAD' ? null : response.body, { status: response.status, headers });
+            });
+          }
+          module.exports = { SCHEME, ORIGIN, privileges, installLocalOrigin };
+          MYAPPS_SCRIPT
+          cat > desktop/verify-bundle.cjs <<'MYAPPS_SCRIPT'
+          module.exports = async function verifyBundle(win, localSession, origin) {
+            const assert = require('assert/strict');
+            const html = await localSession.fetch(origin);
+            assert.equal(html.status, 200);
+            assert.match(html.headers.get('content-type') || '', /text\/html/);
+            const index = await html.text();
+            const deep = await localSession.fetch(origin + '__myapps_probe__/route', { headers: { Accept: 'text/html' } });
+            assert.equal(deep.status, 200);
+            assert.equal(await deep.text(), index, 'SPA document fallback differs from index.html');
+            assert.equal((await localSession.fetch(origin + '__myapps_missing__.js')).status, 404);
+            let checked = 0;
+            for (const tag of index.match(/<(?:script|link)\b[^>]*>/gi) || []) {
+              if (/^<link/i.test(tag) && !/\brel\s*=\s*["'](?:stylesheet|modulepreload)["']/i.test(tag)) continue;
+              const match = tag.match(/\b(?:src|href)\s*=\s*["']([^"']+)["']/i);
+              if (!match) continue;
+              const url = new URL(match[1], origin);
+              if (url.protocol !== 'myapps:') continue;
+              const response = await localSession.fetch(url.href);
+              assert.equal(response.status, 200, 'Entry asset missing: ' + url.href);
+              assert.doesNotMatch(response.headers.get('content-type') || '', /text\/html/);
+              checked++;
+            }
+            await win.loadURL(origin);
+            const waitForContent = async () => {
+              for (let attempt = 0; attempt < 60; attempt++) {
+                const rendered = await win.webContents.executeJavaScript(
+                  '(() => { const b=document.body.cloneNode(true); b.querySelectorAll("script,style,noscript").forEach(n=>n.remove()); return !!(b.textContent.trim() || b.querySelector("img,svg,canvas,video,iframe,input,button")); })()'
+                );
+                if (rendered) return;
+                await new Promise((resolve) => setTimeout(resolve, 250));
+              }
+              throw new Error('The bundled app rendered an empty document after 15 seconds.');
+            };
+            await waitForContent();
+            await win.webContents.executeJavaScript('history.pushState({}, "", "/__myapps_probe__/route")');
+            await Promise.race([
+              new Promise((resolve, reject) => {
+                win.webContents.once('did-finish-load', resolve);
+                win.webContents.once('did-fail-load', (_event, code, message) => reject(new Error(code + ': ' + message)));
+                win.webContents.reload();
+              }),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('SPA reload timed out.')), 20000)),
+            ]);
+            await waitForContent();
+            assert.equal(new URL(win.webContents.getURL()).pathname, '/__myapps_probe__/route');
+            console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ origin, platform: process.platform, level: 'renderer', checked, spaFallback: true, historyReload: true }));
+          };
+          MYAPPS_SCRIPT
           cat > desktop/main.js <<'JS'
-          const { app, BrowserWindow, shell } = require('electron');
+          const { app, BrowserWindow, shell, protocol, session } = require('electron');
           const path = require('path');
           const config = require('./config.json');
-          const origin = config.targetUrl ? new URL(config.targetUrl).origin : '';
-
+          const local = require('./local-origin.cjs');
+          const verifying = process.argv.includes('--verify-local-bundle');
+          protocol.registerSchemesAsPrivileged([{ scheme: local.SCHEME, privileges: local.privileges }]);
+          const startUrl = config.targetUrl || local.ORIGIN;
+          const sameOrigin = (url) => {
+            try { const a = new URL(startUrl), b = new URL(url); return a.protocol === b.protocol && a.host === b.host; }
+            catch { return false; }
+          };
+          let localSession;
           function createWindow() {
             const win = new BrowserWindow({
-              width: 1200,
-              height: 820,
-              minWidth: 760,
-              minHeight: 540,
-              title: config.appName,
-              autoHideMenuBar: true,
-              backgroundColor: '#ffffff',
-              webPreferences: { contextIsolation: true, nodeIntegration: false },
+              width: 1200, height: 820, minWidth: 760, minHeight: 540,
+              title: config.appName, autoHideMenuBar: true, backgroundColor: '#ffffff',
+              show: !verifying,
+              webPreferences: { session: localSession, contextIsolation: true, nodeIntegration: false, sandbox: true },
             });
-            if (config.targetUrl) {
-              win.loadURL(config.targetUrl);
-              win.webContents.on('will-navigate', (event, url) => {
-                if (!url.startsWith(origin)) {
-                  event.preventDefault();
-                  shell.openExternal(url);
-                }
-              });
-            } else {
-              // Codebase build: the site's files are shipped inside the app.
-              win.loadFile(path.join(__dirname, 'app', 'index.html'));
-            }
+            win.webContents.on('will-navigate', (event, url) => {
+              if (!sameOrigin(url)) {
+                event.preventDefault();
+                if (/^https?:/i.test(url)) shell.openExternal(url);
+              }
+            });
             win.webContents.setWindowOpenHandler(({ url }) => {
               if (/^https?:/i.test(url)) shell.openExternal(url);
               return { action: 'deny' };
             });
+            return win;
           }
-
-          app.whenReady().then(createWindow);
-          app.on('window-all-closed', () => {
-            if (process.platform !== 'darwin') app.quit();
-          });
+          app.whenReady().then(async () => {
+            localSession = session.fromPartition(verifying ? 'myapps-verification' : 'persist:myapps');
+            if (!config.targetUrl) {
+              local.installLocalOrigin(localSession, path.join(__dirname, 'app'));
+              console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED ' + local.ORIGIN);
+            }
+            const win = createWindow();
+            if (verifying) {
+              await require('./verify-bundle.cjs')(win, localSession, local.ORIGIN);
+              app.exit(0);
+            } else await win.loadURL(startUrl);
+          }).catch((error) => { console.error(error); app.exit(1); });
+          app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
           app.on('activate', () => {
-            if (BrowserWindow.getAllWindows().length === 0) createWindow();
+            if (localSession && BrowserWindow.getAllWindows().length === 0) createWindow().loadURL(startUrl);
           });
           JS
           cat > desktop/package.json <<JSON
@@ -371,8 +632,8 @@ jobs:
             "main": "main.js",
             "author": "MyApps Convertor",
             "description": "$APP_NAME",
-            "files": ["main.js", "config.json", "app/**/*"],
             "build": {
+              "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "app/**/*"],
               "appId": "com.myapps.$SLUG",
               "productName": "$APP_NAME",
               "directories": { "output": "dist" },
@@ -395,6 +656,68 @@ jobs:
           set -euo pipefail
           ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
           if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
+          cat > /tmp/myapps-normalize-bundle.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          let rewritten = 0;
+          let scanned = 0;
+          function localFile(url) {
+            const pathname = decodeURIComponent(url.split(/[?#]/)[0]);
+            const full = path.resolve(root, '.' + pathname);
+            return full.startsWith(root + path.sep) && fs.existsSync(full) && fs.statSync(full).isFile();
+          }
+          function normalize(url) {
+            // Never rewrite external URLs, API calls, router paths, or computed JS strings.
+            if (!/^\/(?!\/)/.test(url) || !/\.[a-z0-9]{1,8}(?:[?#]|$)/i.test(url)) return url;
+            if (localFile(url)) return url;
+            const segments = url.split('/');
+            for (let i = 2; i < segments.length; i++) {
+              const candidate = '/' + segments.slice(i).join('/');
+              if (localFile(candidate)) { rewritten++; return candidate; }
+            }
+            return url;
+          }
+          function walk(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (entry.isSymbolicLink()) throw new Error('Bundle symlinks are not supported: ' + entry.name);
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory()) { walk(file); continue; }
+              if (!/\.(html|css|[cm]?js)$/i.test(file)) continue;
+              scanned++;
+              let text = fs.readFileSync(file, 'utf8');
+              // Quoted root paths in HTML and JS, and CSS url()/@import references.
+              text = text.replace(/(["'\x60])(\/(?!\/)[^"'\x60\s<>]*?)\1/g,
+                (match, quote, url) => quote + normalize(url) + quote);
+              text = text.replace(/url\(\s*(\/(?!\/)[^\s)'"<>]+)\s*\)/g,
+                (match, url) => 'url(' + normalize(url) + ')');
+              text = text.replace(/(\bsrcset\s*=\s*["'])([^"']+)(["'])/gi,
+                (match, start, values, end) => start + values.replace(/(^|,\s*)(\/[^\s,]+)/g,
+                  (item, gap, url) => gap + normalize(url)) + end);
+              if (file === path.join(root, 'index.html')) {
+                // A stable base is essential when an SPA refreshes a nested route.
+                if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
+                if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
+                text = text.replace(/<head\b[^>]*>/i, '$&<base href="/">');
+              }
+              fs.writeFileSync(file, text);
+            }
+          }
+          walk(root);
+          const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+          let entryAssets = 0;
+          for (const tag of html.match(/<(?:script|link)\b[^>]*>/gi) || []) {
+            if (/^<link/i.test(tag) && !/\brel\s*=\s*["'](?:stylesheet|modulepreload|preload)["']/i.test(tag)) continue;
+            const match = tag.match(/\b(?:src|href)\s*=\s*["']([^"']+)["']/i);
+            if (!match || /^(?:[a-z]+:|\/\/|#)/i.test(match[1])) continue;
+            const url = new URL(match[1], 'https://localhost/');
+            if (/\.(?:tsx?|jsx)$/i.test(url.pathname) || !localFile(url.pathname)) {
+              throw new Error('Missing or uncompiled entry asset: ' + match[1] + '. Upload a browser-ready build.');
+            }
+            entryAssets++;
+          }
+          console.log('MYAPPS_ASSETS_NORMALIZED ' + JSON.stringify({ scanned, rewritten, entryAssets, base: '/' }));
+          MYAPPS_SCRIPT
           prepare_codebase() {
             dest="$1"
             dl="/tmp/myapps-codebase.zip"
@@ -440,14 +763,14 @@ jobs:
 
             # Where a compiled project puts the files that run in a browser.
             find_output() {
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
               if [ -n "$2" ]; then
                 fresh=$(find "$1" -maxdepth 4 -name index.html -newer "$2" \
                   -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
                 if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
               fi
-              for candidate in dist out build .next/out .output/public site _site public www; do
-                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
-              done
               return 1
             }
 
@@ -468,7 +791,8 @@ jobs:
               )
               root=$(find_output "$project" "$stamp" || true)
               if [ -z "$root" ]; then
-                echo "::warning::The project built, but no site output was found - using the files as uploaded."
+                echo "::error::The build did not produce a static site. Export browser-ready output (dist, build or out); a server-only app cannot run offline."
+                exit 1
               fi
             fi
             if [ -z "$root" ]; then root=$(find_entry "$work" || true); fi
@@ -483,9 +807,7 @@ jobs:
             mkdir -p "$dest"
             cp -R "$root/." "$dest/"
             echo "Bundling the site from $(basename "$root")"
-            # Root-absolute paths (src="/assets/app.js") only resolve on a web
-            # server, so they become relative and load from inside the app.
-            node -e "const fs=require('fs'),f=process.argv[1];let s=fs.readFileSync(f,'utf8');s=s.replace(/((?:src|href|poster)=[\"'])\/(?!\/)/g,'\$1');fs.writeFileSync(f,s)" "$dest/index.html"
+            node /tmp/myapps-normalize-bundle.cjs "$dest"
             echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
           prepare_codebase "desktop/app"
@@ -511,12 +833,27 @@ jobs:
             echo "::warning::The app icon could not be downloaded - using the default artwork."
           fi
 
-      - name: Package the installer
+      - name: Install desktop tools
+        shell: bash
+        working-directory: desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Verify the local bundle server
+        if: github.event.client_payload.build_type == 'zip'
         shell: bash
         working-directory: desktop
         run: |
-          npm install --no-audit --no-fund
-          npx electron-builder --mac dmg --publish never
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            xvfb-run -a npx electron . --verify-local-bundle
+          else
+            npx electron . --verify-local-bundle
+          fi
+
+      - name: Package the installer
+        shell: bash
+        working-directory: desktop
+        run: npx electron-builder --mac dmg --publish never
 
       - name: Publish the installer
         shell: bash
@@ -596,7 +933,7 @@ jobs:
           set -euo pipefail
           mkdir -p desktop/app
           APP_NAME=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); (p.app_name||"Desktop App").slice(0,60)')
-          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url||""')
+          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.build_type==="zip"?"":p.target_url||""')
           SLUG=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); String(p.app_name||"app").toLowerCase().replace(/[^a-z0-9]+/g,"")||"app"')
           cat > desktop/config.json <<JSON
           {
@@ -604,47 +941,139 @@ jobs:
             "appName": "$APP_NAME"
           }
           JSON
+          cat > desktop/local-origin.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const { pathToFileURL } = require('url');
+          const { net } = require('electron');
+          const SCHEME = 'myapps';
+          const ORIGIN = SCHEME + '://localhost/';
+          const privileges = { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true };
+          function installLocalOrigin(localSession, directory) {
+            const root = fs.realpathSync(directory);
+            const inside = (file) => file === root || file.startsWith(root + path.sep);
+            localSession.protocol.handle(SCHEME, async (request) => {
+              const url = new URL(request.url);
+              if (url.host !== 'localhost') return new Response('Forbidden', { status: 403 });
+              if (!['GET', 'HEAD'].includes(request.method)) return new Response('Method not allowed', { status: 405 });
+              let pathname;
+              try { pathname = decodeURIComponent(url.pathname); } catch { return new Response('Bad path', { status: 400 }); }
+              if (pathname.includes('\\') || pathname.includes('\0')) return new Response('Bad path', { status: 400 });
+              let file = path.resolve(root, '.' + pathname);
+              if (!inside(file)) return new Response('Forbidden', { status: 403 });
+              if (fs.existsSync(file) && fs.statSync(file).isDirectory()) file = path.join(file, 'index.html');
+              if (!fs.existsSync(file)) {
+                // Only documents get SPA fallback; missing JS/CSS must remain a real 404.
+                const documentRequest = request.mode === 'navigate' || (request.headers.get('accept') || '').includes('text/html');
+                if (!documentRequest || path.extname(pathname)) return new Response('Not found', { status: 404 });
+                file = path.join(root, 'index.html');
+              }
+              if (!inside(fs.realpathSync(file)) || !fs.statSync(file).isFile()) return new Response('Forbidden', { status: 403 });
+              const response = await net.fetch(pathToFileURL(file).href);
+              const headers = new Headers(response.headers);
+              headers.set('X-Content-Type-Options', 'nosniff');
+              headers.set('Cache-Control', 'no-cache');
+              return new Response(request.method === 'HEAD' ? null : response.body, { status: response.status, headers });
+            });
+          }
+          module.exports = { SCHEME, ORIGIN, privileges, installLocalOrigin };
+          MYAPPS_SCRIPT
+          cat > desktop/verify-bundle.cjs <<'MYAPPS_SCRIPT'
+          module.exports = async function verifyBundle(win, localSession, origin) {
+            const assert = require('assert/strict');
+            const html = await localSession.fetch(origin);
+            assert.equal(html.status, 200);
+            assert.match(html.headers.get('content-type') || '', /text\/html/);
+            const index = await html.text();
+            const deep = await localSession.fetch(origin + '__myapps_probe__/route', { headers: { Accept: 'text/html' } });
+            assert.equal(deep.status, 200);
+            assert.equal(await deep.text(), index, 'SPA document fallback differs from index.html');
+            assert.equal((await localSession.fetch(origin + '__myapps_missing__.js')).status, 404);
+            let checked = 0;
+            for (const tag of index.match(/<(?:script|link)\b[^>]*>/gi) || []) {
+              if (/^<link/i.test(tag) && !/\brel\s*=\s*["'](?:stylesheet|modulepreload)["']/i.test(tag)) continue;
+              const match = tag.match(/\b(?:src|href)\s*=\s*["']([^"']+)["']/i);
+              if (!match) continue;
+              const url = new URL(match[1], origin);
+              if (url.protocol !== 'myapps:') continue;
+              const response = await localSession.fetch(url.href);
+              assert.equal(response.status, 200, 'Entry asset missing: ' + url.href);
+              assert.doesNotMatch(response.headers.get('content-type') || '', /text\/html/);
+              checked++;
+            }
+            await win.loadURL(origin);
+            const waitForContent = async () => {
+              for (let attempt = 0; attempt < 60; attempt++) {
+                const rendered = await win.webContents.executeJavaScript(
+                  '(() => { const b=document.body.cloneNode(true); b.querySelectorAll("script,style,noscript").forEach(n=>n.remove()); return !!(b.textContent.trim() || b.querySelector("img,svg,canvas,video,iframe,input,button")); })()'
+                );
+                if (rendered) return;
+                await new Promise((resolve) => setTimeout(resolve, 250));
+              }
+              throw new Error('The bundled app rendered an empty document after 15 seconds.');
+            };
+            await waitForContent();
+            await win.webContents.executeJavaScript('history.pushState({}, "", "/__myapps_probe__/route")');
+            await Promise.race([
+              new Promise((resolve, reject) => {
+                win.webContents.once('did-finish-load', resolve);
+                win.webContents.once('did-fail-load', (_event, code, message) => reject(new Error(code + ': ' + message)));
+                win.webContents.reload();
+              }),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('SPA reload timed out.')), 20000)),
+            ]);
+            await waitForContent();
+            assert.equal(new URL(win.webContents.getURL()).pathname, '/__myapps_probe__/route');
+            console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ origin, platform: process.platform, level: 'renderer', checked, spaFallback: true, historyReload: true }));
+          };
+          MYAPPS_SCRIPT
           cat > desktop/main.js <<'JS'
-          const { app, BrowserWindow, shell } = require('electron');
+          const { app, BrowserWindow, shell, protocol, session } = require('electron');
           const path = require('path');
           const config = require('./config.json');
-          const origin = config.targetUrl ? new URL(config.targetUrl).origin : '';
-
+          const local = require('./local-origin.cjs');
+          const verifying = process.argv.includes('--verify-local-bundle');
+          protocol.registerSchemesAsPrivileged([{ scheme: local.SCHEME, privileges: local.privileges }]);
+          const startUrl = config.targetUrl || local.ORIGIN;
+          const sameOrigin = (url) => {
+            try { const a = new URL(startUrl), b = new URL(url); return a.protocol === b.protocol && a.host === b.host; }
+            catch { return false; }
+          };
+          let localSession;
           function createWindow() {
             const win = new BrowserWindow({
-              width: 1200,
-              height: 820,
-              minWidth: 760,
-              minHeight: 540,
-              title: config.appName,
-              autoHideMenuBar: true,
-              backgroundColor: '#ffffff',
-              webPreferences: { contextIsolation: true, nodeIntegration: false },
+              width: 1200, height: 820, minWidth: 760, minHeight: 540,
+              title: config.appName, autoHideMenuBar: true, backgroundColor: '#ffffff',
+              show: !verifying,
+              webPreferences: { session: localSession, contextIsolation: true, nodeIntegration: false, sandbox: true },
             });
-            if (config.targetUrl) {
-              win.loadURL(config.targetUrl);
-              win.webContents.on('will-navigate', (event, url) => {
-                if (!url.startsWith(origin)) {
-                  event.preventDefault();
-                  shell.openExternal(url);
-                }
-              });
-            } else {
-              // Codebase build: the site's files are shipped inside the app.
-              win.loadFile(path.join(__dirname, 'app', 'index.html'));
-            }
+            win.webContents.on('will-navigate', (event, url) => {
+              if (!sameOrigin(url)) {
+                event.preventDefault();
+                if (/^https?:/i.test(url)) shell.openExternal(url);
+              }
+            });
             win.webContents.setWindowOpenHandler(({ url }) => {
               if (/^https?:/i.test(url)) shell.openExternal(url);
               return { action: 'deny' };
             });
+            return win;
           }
-
-          app.whenReady().then(createWindow);
-          app.on('window-all-closed', () => {
-            if (process.platform !== 'darwin') app.quit();
-          });
+          app.whenReady().then(async () => {
+            localSession = session.fromPartition(verifying ? 'myapps-verification' : 'persist:myapps');
+            if (!config.targetUrl) {
+              local.installLocalOrigin(localSession, path.join(__dirname, 'app'));
+              console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED ' + local.ORIGIN);
+            }
+            const win = createWindow();
+            if (verifying) {
+              await require('./verify-bundle.cjs')(win, localSession, local.ORIGIN);
+              app.exit(0);
+            } else await win.loadURL(startUrl);
+          }).catch((error) => { console.error(error); app.exit(1); });
+          app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
           app.on('activate', () => {
-            if (BrowserWindow.getAllWindows().length === 0) createWindow();
+            if (localSession && BrowserWindow.getAllWindows().length === 0) createWindow().loadURL(startUrl);
           });
           JS
           cat > desktop/package.json <<JSON
@@ -655,8 +1084,8 @@ jobs:
             "main": "main.js",
             "author": "MyApps Convertor",
             "description": "$APP_NAME",
-            "files": ["main.js", "config.json", "app/**/*"],
             "build": {
+              "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "app/**/*"],
               "appId": "com.myapps.$SLUG",
               "productName": "$APP_NAME",
               "directories": { "output": "dist" },
@@ -679,6 +1108,68 @@ jobs:
           set -euo pipefail
           ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
           if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
+          cat > /tmp/myapps-normalize-bundle.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          let rewritten = 0;
+          let scanned = 0;
+          function localFile(url) {
+            const pathname = decodeURIComponent(url.split(/[?#]/)[0]);
+            const full = path.resolve(root, '.' + pathname);
+            return full.startsWith(root + path.sep) && fs.existsSync(full) && fs.statSync(full).isFile();
+          }
+          function normalize(url) {
+            // Never rewrite external URLs, API calls, router paths, or computed JS strings.
+            if (!/^\/(?!\/)/.test(url) || !/\.[a-z0-9]{1,8}(?:[?#]|$)/i.test(url)) return url;
+            if (localFile(url)) return url;
+            const segments = url.split('/');
+            for (let i = 2; i < segments.length; i++) {
+              const candidate = '/' + segments.slice(i).join('/');
+              if (localFile(candidate)) { rewritten++; return candidate; }
+            }
+            return url;
+          }
+          function walk(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (entry.isSymbolicLink()) throw new Error('Bundle symlinks are not supported: ' + entry.name);
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory()) { walk(file); continue; }
+              if (!/\.(html|css|[cm]?js)$/i.test(file)) continue;
+              scanned++;
+              let text = fs.readFileSync(file, 'utf8');
+              // Quoted root paths in HTML and JS, and CSS url()/@import references.
+              text = text.replace(/(["'\x60])(\/(?!\/)[^"'\x60\s<>]*?)\1/g,
+                (match, quote, url) => quote + normalize(url) + quote);
+              text = text.replace(/url\(\s*(\/(?!\/)[^\s)'"<>]+)\s*\)/g,
+                (match, url) => 'url(' + normalize(url) + ')');
+              text = text.replace(/(\bsrcset\s*=\s*["'])([^"']+)(["'])/gi,
+                (match, start, values, end) => start + values.replace(/(^|,\s*)(\/[^\s,]+)/g,
+                  (item, gap, url) => gap + normalize(url)) + end);
+              if (file === path.join(root, 'index.html')) {
+                // A stable base is essential when an SPA refreshes a nested route.
+                if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
+                if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
+                text = text.replace(/<head\b[^>]*>/i, '$&<base href="/">');
+              }
+              fs.writeFileSync(file, text);
+            }
+          }
+          walk(root);
+          const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+          let entryAssets = 0;
+          for (const tag of html.match(/<(?:script|link)\b[^>]*>/gi) || []) {
+            if (/^<link/i.test(tag) && !/\brel\s*=\s*["'](?:stylesheet|modulepreload|preload)["']/i.test(tag)) continue;
+            const match = tag.match(/\b(?:src|href)\s*=\s*["']([^"']+)["']/i);
+            if (!match || /^(?:[a-z]+:|\/\/|#)/i.test(match[1])) continue;
+            const url = new URL(match[1], 'https://localhost/');
+            if (/\.(?:tsx?|jsx)$/i.test(url.pathname) || !localFile(url.pathname)) {
+              throw new Error('Missing or uncompiled entry asset: ' + match[1] + '. Upload a browser-ready build.');
+            }
+            entryAssets++;
+          }
+          console.log('MYAPPS_ASSETS_NORMALIZED ' + JSON.stringify({ scanned, rewritten, entryAssets, base: '/' }));
+          MYAPPS_SCRIPT
           prepare_codebase() {
             dest="$1"
             dl="/tmp/myapps-codebase.zip"
@@ -724,14 +1215,14 @@ jobs:
 
             # Where a compiled project puts the files that run in a browser.
             find_output() {
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
               if [ -n "$2" ]; then
                 fresh=$(find "$1" -maxdepth 4 -name index.html -newer "$2" \
                   -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
                 if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
               fi
-              for candidate in dist out build .next/out .output/public site _site public www; do
-                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
-              done
               return 1
             }
 
@@ -752,7 +1243,8 @@ jobs:
               )
               root=$(find_output "$project" "$stamp" || true)
               if [ -z "$root" ]; then
-                echo "::warning::The project built, but no site output was found - using the files as uploaded."
+                echo "::error::The build did not produce a static site. Export browser-ready output (dist, build or out); a server-only app cannot run offline."
+                exit 1
               fi
             fi
             if [ -z "$root" ]; then root=$(find_entry "$work" || true); fi
@@ -767,9 +1259,7 @@ jobs:
             mkdir -p "$dest"
             cp -R "$root/." "$dest/"
             echo "Bundling the site from $(basename "$root")"
-            # Root-absolute paths (src="/assets/app.js") only resolve on a web
-            # server, so they become relative and load from inside the app.
-            node -e "const fs=require('fs'),f=process.argv[1];let s=fs.readFileSync(f,'utf8');s=s.replace(/((?:src|href|poster)=[\"'])\/(?!\/)/g,'\$1');fs.writeFileSync(f,s)" "$dest/index.html"
+            node /tmp/myapps-normalize-bundle.cjs "$dest"
             echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
           prepare_codebase "desktop/app"
@@ -795,12 +1285,27 @@ jobs:
             echo "::warning::The app icon could not be downloaded - using the default artwork."
           fi
 
-      - name: Package the installer
+      - name: Install desktop tools
+        shell: bash
+        working-directory: desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Verify the local bundle server
+        if: github.event.client_payload.build_type == 'zip'
         shell: bash
         working-directory: desktop
         run: |
-          npm install --no-audit --no-fund
-          npx electron-builder --linux AppImage --publish never
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            xvfb-run -a npx electron . --verify-local-bundle
+          else
+            npx electron . --verify-local-bundle
+          fi
+
+      - name: Package the installer
+        shell: bash
+        working-directory: desktop
+        run: npx electron-builder --linux AppImage --publish never
 
       - name: Publish the installer
         shell: bash
