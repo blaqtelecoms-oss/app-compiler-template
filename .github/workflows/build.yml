@@ -1,4 +1,5 @@
 name: Build mobile app
+run-name: "MyApps ${{ github.event.client_payload.build_id }} (${{ github.event.client_payload.platform }})"
 
 on:
   repository_dispatch:
@@ -179,6 +180,68 @@ jobs:
           set -euo pipefail
           ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
           if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
+          cat > /tmp/myapps-normalize-bundle.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          let rewritten = 0;
+          let scanned = 0;
+          function localFile(url) {
+            const pathname = decodeURIComponent(url.split(/[?#]/)[0]);
+            const full = path.resolve(root, '.' + pathname);
+            return full.startsWith(root + path.sep) && fs.existsSync(full) && fs.statSync(full).isFile();
+          }
+          function normalize(url) {
+            // Never rewrite external URLs, API calls, router paths, or computed JS strings.
+            if (!/^\/(?!\/)/.test(url) || !/\.[a-z0-9]{1,8}(?:[?#]|$)/i.test(url)) return url;
+            if (localFile(url)) return url;
+            const segments = url.split('/');
+            for (let i = 2; i < segments.length; i++) {
+              const candidate = '/' + segments.slice(i).join('/');
+              if (localFile(candidate)) { rewritten++; return candidate; }
+            }
+            return url;
+          }
+          function walk(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (entry.isSymbolicLink()) throw new Error('Bundle symlinks are not supported: ' + entry.name);
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory()) { walk(file); continue; }
+              if (!/\.(html|css|[cm]?js)$/i.test(file)) continue;
+              scanned++;
+              let text = fs.readFileSync(file, 'utf8');
+              // Quoted root paths in HTML and JS, and CSS url()/@import references.
+              text = text.replace(/(["'\x60])(\/(?!\/)[^"'\x60\s<>]*?)\1/g,
+                (match, quote, url) => quote + normalize(url) + quote);
+              text = text.replace(/url\(\s*(\/(?!\/)[^\s)'"<>]+)\s*\)/g,
+                (match, url) => 'url(' + normalize(url) + ')');
+              text = text.replace(/(\bsrcset\s*=\s*["'])([^"']+)(["'])/gi,
+                (match, start, values, end) => start + values.replace(/(^|,\s*)(\/[^\s,]+)/g,
+                  (item, gap, url) => gap + normalize(url)) + end);
+              if (file === path.join(root, 'index.html')) {
+                // A stable base is essential when an SPA refreshes a nested route.
+                if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
+                if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
+                text = text.replace(/<head\b[^>]*>/i, '      - name: Compile the APK<base href="/">');
+              }
+              fs.writeFileSync(file, text);
+            }
+          }
+          walk(root);
+          const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+          let entryAssets = 0;
+          for (const tag of html.match(/<(?:script|link)\b[^>]*>/gi) || []) {
+            if (/^<link/i.test(tag) && !/\brel\s*=\s*["'](?:stylesheet|modulepreload|preload)["']/i.test(tag)) continue;
+            const match = tag.match(/\b(?:src|href)\s*=\s*["']([^"']+)["']/i);
+            if (!match || /^(?:[a-z]+:|\/\/|#)/i.test(match[1])) continue;
+            const url = new URL(match[1], 'https://localhost/');
+            if (/\.(?:tsx?|jsx)$/i.test(url.pathname) || !localFile(url.pathname)) {
+              throw new Error('Missing or uncompiled entry asset: ' + match[1] + '. Upload a browser-ready build.');
+            }
+            entryAssets++;
+          }
+          console.log('MYAPPS_ASSETS_NORMALIZED ' + JSON.stringify({ scanned, rewritten, entryAssets, base: '/' }));
+          MYAPPS_SCRIPT
           prepare_codebase() {
             dest="$1"
             dl="/tmp/myapps-codebase.zip"
@@ -224,6 +287,9 @@ jobs:
 
             # Where a compiled project puts the files that run in a browser.
             find_output() {
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
               if [ -n "$2" ]; then
                 fresh=$(find "$1" -maxdepth 4 -name index.html -newer "$2" \
                   -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
@@ -252,7 +318,8 @@ jobs:
               )
               root=$(find_output "$project" "$stamp" || true)
               if [ -z "$root" ]; then
-                echo "::warning::The project built, but no site output was found - using the files as uploaded."
+                echo "::error::The build did not produce a static site. Export browser-ready output (dist, build or out); a server-only app cannot run offline."
+                exit 1
               fi
             fi
             if [ -z "$root" ]; then root=$(find_entry "$work" || true); fi
@@ -267,15 +334,74 @@ jobs:
             mkdir -p "$dest"
             cp -R "$root/." "$dest/"
             echo "Bundling the site from $(basename "$root")"
-            # Root-absolute paths (src="/assets/app.js") only resolve on a web
-            # server, so they become relative and load from inside the app.
-            node -e "const fs=require('fs'),f=process.argv[1];let s=fs.readFileSync(f,'utf8');s=s.replace(/((?:src|href|poster)=[\"'])\/(?!\/)/g,'\$1');fs.writeFileSync(f,s)" "$dest/index.html"
+            node /tmp/myapps-normalize-bundle.cjs "$dest"
             echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
           prepare_codebase "wrapper/www"
-          node -e 'const fs=require("fs");const p="wrapper/capacitor.config.json";if(fs.existsSync(p)){const c=JSON.parse(fs.readFileSync(p,"utf8"));delete c.server;fs.writeFileSync(p,JSON.stringify(c,null,2));}'
-          (cd wrapper && npx cap copy android)
-          echo "The app ships its own files, so it runs without a connection."
+          cat > /tmp/myapps-configure-mobile.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const file = 'wrapper/capacitor.config.json';
+          if (!fs.existsSync(file)) throw new Error('The Capacitor JSON configuration is missing.');
+          const config = JSON.parse(fs.readFileSync(file, 'utf8'));
+          config.webDir = 'www';
+          config.server = { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false };
+          fs.writeFileSync(file, JSON.stringify(config, null, 2));
+          console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED https://localhost capacitor://localhost webDir=www');
+          MYAPPS_SCRIPT
+          node /tmp/myapps-configure-mobile.cjs
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
+          (cd wrapper && npx cap copy "$PLATFORM")
+
+      - name: Verify the local bundle server
+        if: github.event.client_payload.build_type == 'zip'
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/myapps-verify-mobile.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+          const assert = require('assert/strict');
+          const platform = process.argv[2];
+          const android = platform === 'android';
+          const nativeRoot = android ? 'wrapper/android/app/src/main/assets' : 'wrapper/ios/App/App';
+          const config = JSON.parse(fs.readFileSync(nativeRoot + '/capacitor.config.json', 'utf8'));
+          assert.equal(config.webDir, 'www');
+          assert.equal(config.server.hostname, 'localhost');
+          assert.equal(config.server.androidScheme, 'https');
+          assert.equal(config.server.iosScheme, 'capacitor');
+          assert.ok(!config.server.url, 'A remote URL overrides the embedded asset server.');
+          const bundle = path.resolve('wrapper/www');
+          const nativeBundle = path.resolve(nativeRoot, 'public');
+          let checked = 0;
+          function verify(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const source = path.join(dir, entry.name);
+              if (entry.isDirectory()) { verify(source); continue; }
+              const copied = path.join(nativeBundle, path.relative(bundle, source));
+              const hash = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+              assert.equal(hash(copied), hash(source), 'Native asset mismatch: ' + source);
+              checked++;
+            }
+          }
+          verify(bundle);
+          assert.match(fs.readFileSync(path.join(nativeBundle, 'index.html'), 'utf8'), /<base href="\/">/);
+          if (android) {
+            const core = 'wrapper/node_modules/@capacitor/android/capacitor/src/main/java/com/getcapacitor/';
+            assert.match(fs.readFileSync(core + 'Bridge.java', 'utf8'), /new WebViewLocalServer\([\s\S]{0,600},\s*true\s*\)/);
+            assert.match(fs.readFileSync(core + 'WebViewLocalServer.java', 'utf8'), /html5mode/);
+          } else {
+            const core = 'wrapper/node_modules/@capacitor/ios/Capacitor/Capacitor/';
+            assert.match(fs.readFileSync(core + 'WebViewAssetHandler.swift', 'utf8'), /WKURLSchemeHandler/);
+            assert.match(fs.readFileSync(core + 'Router.swift', 'utf8'), /index\.html/);
+          }
+          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, spaFallback: true, nativeAssets: true }));
+          MYAPPS_SCRIPT
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
+          node /tmp/myapps-verify-mobile.cjs "$PLATFORM"
+
       - name: Compile the APK
         working-directory: wrapper/android
         run: ./gradlew assembleDebug --no-daemon
@@ -315,8 +441,266 @@ jobs:
 
   ios:
     if: github.event.client_payload.platform == 'ios'
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
+      - name: Set up Node.js
+
+        uses: actions/setup-node@v4
+
+        with:
+
+          node-version: '20'
+
+      - name: Prepare the iOS wrapper
+        if: github.event.client_payload.build_type == 'zip'
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          mkdir -p wrapper/www
+          cat > /tmp/myapps-prepare-ios.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const p = JSON.parse(process.env.PAYLOAD || '{}');
+          const c = p.app_config || {};
+          fs.writeFileSync('wrapper/www/index.html', '<!doctype html><html><head><title>Loading</title></head><body>Loading</body></html>');
+          fs.writeFileSync('wrapper/package.json', JSON.stringify({ name: 'myapps-ios-wrapper', private: true, devDependencies: { '@capacitor/cli': '^7.0.0' }, dependencies: { '@capacitor/core': '^7.0.0', '@capacitor/ios': '^7.0.0', '@capacitor/splash-screen': '^7.0.0' } }));
+          fs.writeFileSync('wrapper/capacitor.config.json', JSON.stringify({ appId: p.package_name || c.package_name || 'com.myapps.app', appName: p.app_name || 'My App', webDir: 'www', server: { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false } }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-prepare-ios.cjs
+          (cd wrapper && npm install --no-audit --no-fund && npx cap add ios && npx cap sync ios)
+
+      - name: Bundle the uploaded codebase for offline use
+        if: github.event.client_payload.build_type == 'zip'
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
+          if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
+          cat > /tmp/myapps-normalize-bundle.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          let rewritten = 0;
+          let scanned = 0;
+          function localFile(url) {
+            const pathname = decodeURIComponent(url.split(/[?#]/)[0]);
+            const full = path.resolve(root, '.' + pathname);
+            return full.startsWith(root + path.sep) && fs.existsSync(full) && fs.statSync(full).isFile();
+          }
+          function normalize(url) {
+            // Never rewrite external URLs, API calls, router paths, or computed JS strings.
+            if (!/^\/(?!\/)/.test(url) || !/\.[a-z0-9]{1,8}(?:[?#]|$)/i.test(url)) return url;
+            if (localFile(url)) return url;
+            const segments = url.split('/');
+            for (let i = 2; i < segments.length; i++) {
+              const candidate = '/' + segments.slice(i).join('/');
+              if (localFile(candidate)) { rewritten++; return candidate; }
+            }
+            return url;
+          }
+          function walk(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (entry.isSymbolicLink()) throw new Error('Bundle symlinks are not supported: ' + entry.name);
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory()) { walk(file); continue; }
+              if (!/\.(html|css|[cm]?js)$/i.test(file)) continue;
+              scanned++;
+              let text = fs.readFileSync(file, 'utf8');
+              // Quoted root paths in HTML and JS, and CSS url()/@import references.
+              text = text.replace(/(["'\x60])(\/(?!\/)[^"'\x60\s<>]*?)\1/g,
+                (match, quote, url) => quote + normalize(url) + quote);
+              text = text.replace(/url\(\s*(\/(?!\/)[^\s)'"<>]+)\s*\)/g,
+                (match, url) => 'url(' + normalize(url) + ')');
+              text = text.replace(/(\bsrcset\s*=\s*["'])([^"']+)(["'])/gi,
+                (match, start, values, end) => start + values.replace(/(^|,\s*)(\/[^\s,]+)/g,
+                  (item, gap, url) => gap + normalize(url)) + end);
+              if (file === path.join(root, 'index.html')) {
+                // A stable base is essential when an SPA refreshes a nested route.
+                if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
+                if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
+                text = text.replace(/<head\b[^>]*>/i, '      - name: Report that iOS signing is not configured<base href="/">');
+              }
+              fs.writeFileSync(file, text);
+            }
+          }
+          walk(root);
+          const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+          let entryAssets = 0;
+          for (const tag of html.match(/<(?:script|link)\b[^>]*>/gi) || []) {
+            if (/^<link/i.test(tag) && !/\brel\s*=\s*["'](?:stylesheet|modulepreload|preload)["']/i.test(tag)) continue;
+            const match = tag.match(/\b(?:src|href)\s*=\s*["']([^"']+)["']/i);
+            if (!match || /^(?:[a-z]+:|\/\/|#)/i.test(match[1])) continue;
+            const url = new URL(match[1], 'https://localhost/');
+            if (/\.(?:tsx?|jsx)$/i.test(url.pathname) || !localFile(url.pathname)) {
+              throw new Error('Missing or uncompiled entry asset: ' + match[1] + '. Upload a browser-ready build.');
+            }
+            entryAssets++;
+          }
+          console.log('MYAPPS_ASSETS_NORMALIZED ' + JSON.stringify({ scanned, rewritten, entryAssets, base: '/' }));
+          MYAPPS_SCRIPT
+          prepare_codebase() {
+            dest="$1"
+            dl="/tmp/myapps-codebase.zip"
+            work="/tmp/myapps-codebase"
+            rm -rf "$work" "$dest"
+            mkdir -p "$work"
+            echo "Downloading the uploaded archive"
+            curl -sSL --fail "$ZIP_URL" -o "$dl"
+            if [ "${RUNNER_OS:-Linux}" = "Windows" ]; then
+              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$dl")' -DestinationPath '$(cygpath -w "$work")' -Force"
+            else
+              unzip -q "$dl" -d "$work"
+            fi
+
+            # The shallowest index.html is the website's entry point.
+            find_entry() {
+              depth=1
+              while [ "$depth" -le 5 ]; do
+                hit=$(find "$1" -mindepth "$depth" -maxdepth "$depth" -name index.html \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit)
+                if [ -n "$hit" ]; then dirname "$hit"; return 0; fi
+                depth=$((depth + 1))
+              done
+              return 1
+            }
+
+            # A project with a build script is a source tree - it has to be compiled.
+            find_project() {
+              if [ -f "$1/package.json" ]; then
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$1/package.json" >/dev/null 2>&1; then
+                  printf '%s' "$1"; return 0
+                fi
+              fi
+              find "$1" -mindepth 2 -maxdepth 3 -name package.json \
+                -not -path '*/node_modules/*' -not -path '*/.git/*' -print > /tmp/myapps-manifests.txt 2>/dev/null || true
+              while read -r manifest; do
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$manifest" >/dev/null 2>&1; then
+                  dirname "$manifest"; return 0
+                fi
+              done < /tmp/myapps-manifests.txt
+              return 1
+            }
+
+            # Where a compiled project puts the files that run in a browser.
+            find_output() {
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
+              if [ -n "$2" ]; then
+                fresh=$(find "$1" -maxdepth 4 -name index.html -newer "$2" \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
+                if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
+              fi
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
+              return 1
+            }
+
+            root=""
+            project=$(find_project "$work" || true)
+            if [ -n "$project" ]; then
+              echo "Found a source project - running its build command"
+              stamp=/tmp/myapps-build-stamp
+              touch "$stamp"
+              (
+                cd "$project"
+                if [ -f package-lock.json ]; then
+                  npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+                else
+                  npm install --no-audit --no-fund
+                fi
+                npm run build
+              )
+              root=$(find_output "$project" "$stamp" || true)
+              if [ -z "$root" ]; then
+                echo "::error::The build did not produce a static site. Export browser-ready output (dist, build or out); a server-only app cannot run offline."
+                exit 1
+              fi
+            fi
+            if [ -z "$root" ]; then root=$(find_entry "$work" || true); fi
+
+            if [ -z "$root" ] || [ ! -f "$root/index.html" ]; then
+              echo "::error::No browser-ready site was found in the archive. Upload a built site with index.html at its root, or a project whose build command produces one."
+              echo "Files found in the archive:"
+              ls -1 "$work" | head -n 15 || true
+              exit 1
+            fi
+
+            mkdir -p "$dest"
+            cp -R "$root/." "$dest/"
+            echo "Bundling the site from $(basename "$root")"
+            node /tmp/myapps-normalize-bundle.cjs "$dest"
+            echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
+          }
+          prepare_codebase "wrapper/www"
+          cat > /tmp/myapps-configure-mobile.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const file = 'wrapper/capacitor.config.json';
+          if (!fs.existsSync(file)) throw new Error('The Capacitor JSON configuration is missing.');
+          const config = JSON.parse(fs.readFileSync(file, 'utf8'));
+          config.webDir = 'www';
+          config.server = { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false };
+          fs.writeFileSync(file, JSON.stringify(config, null, 2));
+          console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED https://localhost capacitor://localhost webDir=www');
+          MYAPPS_SCRIPT
+          node /tmp/myapps-configure-mobile.cjs
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
+          (cd wrapper && npx cap copy "$PLATFORM")
+
+      - name: Verify the local bundle server
+        if: github.event.client_payload.build_type == 'zip'
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/myapps-verify-mobile.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+          const assert = require('assert/strict');
+          const platform = process.argv[2];
+          const android = platform === 'android';
+          const nativeRoot = android ? 'wrapper/android/app/src/main/assets' : 'wrapper/ios/App/App';
+          const config = JSON.parse(fs.readFileSync(nativeRoot + '/capacitor.config.json', 'utf8'));
+          assert.equal(config.webDir, 'www');
+          assert.equal(config.server.hostname, 'localhost');
+          assert.equal(config.server.androidScheme, 'https');
+          assert.equal(config.server.iosScheme, 'capacitor');
+          assert.ok(!config.server.url, 'A remote URL overrides the embedded asset server.');
+          const bundle = path.resolve('wrapper/www');
+          const nativeBundle = path.resolve(nativeRoot, 'public');
+          let checked = 0;
+          function verify(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const source = path.join(dir, entry.name);
+              if (entry.isDirectory()) { verify(source); continue; }
+              const copied = path.join(nativeBundle, path.relative(bundle, source));
+              const hash = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+              assert.equal(hash(copied), hash(source), 'Native asset mismatch: ' + source);
+              checked++;
+            }
+          }
+          verify(bundle);
+          assert.match(fs.readFileSync(path.join(nativeBundle, 'index.html'), 'utf8'), /<base href="\/">/);
+          if (android) {
+            const core = 'wrapper/node_modules/@capacitor/android/capacitor/src/main/java/com/getcapacitor/';
+            assert.match(fs.readFileSync(core + 'Bridge.java', 'utf8'), /new WebViewLocalServer\([\s\S]{0,600},\s*true\s*\)/);
+            assert.match(fs.readFileSync(core + 'WebViewLocalServer.java', 'utf8'), /html5mode/);
+          } else {
+            const core = 'wrapper/node_modules/@capacitor/ios/Capacitor/Capacitor/';
+            assert.match(fs.readFileSync(core + 'WebViewAssetHandler.swift', 'utf8'), /WKURLSchemeHandler/);
+            assert.match(fs.readFileSync(core + 'Router.swift', 'utf8'), /index\.html/);
+          }
+          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, spaFallback: true, nativeAssets: true }));
+          MYAPPS_SCRIPT
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
+          node /tmp/myapps-verify-mobile.cjs "$PLATFORM"
+
       - name: Report that iOS signing is not configured
         env:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
