@@ -125,6 +125,7 @@ jobs:
           MYAPPS_SCRIPT
           cat > desktop/main.js <<'JS'
           const { app, BrowserWindow, shell, protocol, session } = require('electron');
+          const fs = require('fs');
           const path = require('path');
           const config = require('./config.json');
           const local = require('./local-origin.cjs');
@@ -136,11 +137,27 @@ jobs:
             catch { return false; }
           };
           let localSession;
+          let splash;
+          // A splash window is shown only when the build shipped splash artwork.
+          function showSplash() {
+            if (verifying) return;
+            if (!fs.existsSync(path.join(__dirname, 'splash.png'))) return;
+            splash = new BrowserWindow({
+              width: 400, height: 660, frame: false, resizable: false, backgroundColor: '#ffffff',
+              webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+            });
+            splash.loadFile(path.join(__dirname, 'splash.html'));
+          }
+          function closeSplash() {
+            if (!splash) return;
+            if (!splash.isDestroyed()) splash.destroy();
+            splash = null;
+          }
           function createWindow() {
             const win = new BrowserWindow({
               width: 1200, height: 820, minWidth: 760, minHeight: 540,
               title: config.appName, autoHideMenuBar: true, backgroundColor: '#ffffff',
-              show: !verifying,
+              show: false,
               webPreferences: { session: localSession, contextIsolation: true, nodeIntegration: false, sandbox: true },
             });
             win.webContents.on('will-navigate', (event, url) => {
@@ -153,6 +170,10 @@ jobs:
               if (/^https?:/i.test(url)) shell.openExternal(url);
               return { action: 'deny' };
             });
+            win.once('ready-to-show', () => {
+              closeSplash();
+              if (!verifying) win.show();
+            });
             return win;
           }
           app.whenReady().then(async () => {
@@ -161,6 +182,7 @@ jobs:
               local.installLocalOrigin(localSession, path.join(__dirname, 'app'));
               console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED ' + local.ORIGIN);
             }
+            showSplash();
             const win = createWindow();
             if (verifying) {
               await require('./verify-bundle.cjs')(win, localSession, local.ORIGIN);
@@ -172,6 +194,20 @@ jobs:
             if (localSession && BrowserWindow.getAllWindows().length === 0) createWindow().loadURL(startUrl);
           });
           JS
+          cat > desktop/splash.html <<'HTML'
+          <!doctype html>
+          <html>
+            <head>
+              <meta charset="utf-8" />
+              <style>
+                html, body { margin: 0; height: 100%; background: #ffffff; }
+                body { display: flex; align-items: center; justify-content: center; }
+                img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+              </style>
+            </head>
+            <body><img src="splash.png" alt="" /></body>
+          </html>
+          HTML
           cat > desktop/package.json <<JSON
           {
             "name": "$SLUG",
@@ -181,7 +217,7 @@ jobs:
             "author": "MyApps Convertor",
             "description": "$APP_NAME",
             "build": {
-              "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "app/**/*"],
+              "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "splash.html", "splash.*", "app/**/*"],
               "appId": "com.myapps.$SLUG",
               "productName": "$APP_NAME",
               "directories": { "output": "dist" },
@@ -381,6 +417,25 @@ jobs:
             echo "Applied the uploaded app icon"
           else
             echo "::warning::The app icon could not be downloaded - using the default artwork."
+          fi
+
+      # A splash screen is applied where the desktop runtime shows one: the
+      # Electron shell paints it while the main window loads.
+      - name: Apply the splash screen
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          SPLASH_URL=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.splash_screen_url||""')
+          if [ -z "$SPLASH_URL" ]; then
+            echo "No splash screen was uploaded - the app opens straight into its window."
+            exit 0
+          fi
+          if curl -sSL --fail "$SPLASH_URL" -o desktop/splash.png; then
+            echo "Applied the uploaded splash screen"
+          else
+            echo "::warning::The splash screen could not be downloaded - the app starts without one."
           fi
 
       - name: Install desktop tools
@@ -581,6 +636,7 @@ jobs:
           MYAPPS_SCRIPT
           cat > desktop/main.js <<'JS'
           const { app, BrowserWindow, shell, protocol, session } = require('electron');
+          const fs = require('fs');
           const path = require('path');
           const config = require('./config.json');
           const local = require('./local-origin.cjs');
@@ -592,11 +648,27 @@ jobs:
             catch { return false; }
           };
           let localSession;
+          let splash;
+          // A splash window is shown only when the build shipped splash artwork.
+          function showSplash() {
+            if (verifying) return;
+            if (!fs.existsSync(path.join(__dirname, 'splash.png'))) return;
+            splash = new BrowserWindow({
+              width: 400, height: 660, frame: false, resizable: false, backgroundColor: '#ffffff',
+              webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+            });
+            splash.loadFile(path.join(__dirname, 'splash.html'));
+          }
+          function closeSplash() {
+            if (!splash) return;
+            if (!splash.isDestroyed()) splash.destroy();
+            splash = null;
+          }
           function createWindow() {
             const win = new BrowserWindow({
               width: 1200, height: 820, minWidth: 760, minHeight: 540,
               title: config.appName, autoHideMenuBar: true, backgroundColor: '#ffffff',
-              show: !verifying,
+              show: false,
               webPreferences: { session: localSession, contextIsolation: true, nodeIntegration: false, sandbox: true },
             });
             win.webContents.on('will-navigate', (event, url) => {
@@ -609,6 +681,10 @@ jobs:
               if (/^https?:/i.test(url)) shell.openExternal(url);
               return { action: 'deny' };
             });
+            win.once('ready-to-show', () => {
+              closeSplash();
+              if (!verifying) win.show();
+            });
             return win;
           }
           app.whenReady().then(async () => {
@@ -617,6 +693,7 @@ jobs:
               local.installLocalOrigin(localSession, path.join(__dirname, 'app'));
               console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED ' + local.ORIGIN);
             }
+            showSplash();
             const win = createWindow();
             if (verifying) {
               await require('./verify-bundle.cjs')(win, localSession, local.ORIGIN);
@@ -628,6 +705,20 @@ jobs:
             if (localSession && BrowserWindow.getAllWindows().length === 0) createWindow().loadURL(startUrl);
           });
           JS
+          cat > desktop/splash.html <<'HTML'
+          <!doctype html>
+          <html>
+            <head>
+              <meta charset="utf-8" />
+              <style>
+                html, body { margin: 0; height: 100%; background: #ffffff; }
+                body { display: flex; align-items: center; justify-content: center; }
+                img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+              </style>
+            </head>
+            <body><img src="splash.png" alt="" /></body>
+          </html>
+          HTML
           cat > desktop/package.json <<JSON
           {
             "name": "$SLUG",
@@ -637,7 +728,7 @@ jobs:
             "author": "MyApps Convertor",
             "description": "$APP_NAME",
             "build": {
-              "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "app/**/*"],
+              "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "splash.html", "splash.*", "app/**/*"],
               "appId": "com.myapps.$SLUG",
               "productName": "$APP_NAME",
               "directories": { "output": "dist" },
@@ -837,6 +928,25 @@ jobs:
             echo "Applied the uploaded app icon"
           else
             echo "::warning::The app icon could not be downloaded - using the default artwork."
+          fi
+
+      # A splash screen is applied where the desktop runtime shows one: the
+      # Electron shell paints it while the main window loads.
+      - name: Apply the splash screen
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          SPLASH_URL=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.splash_screen_url||""')
+          if [ -z "$SPLASH_URL" ]; then
+            echo "No splash screen was uploaded - the app opens straight into its window."
+            exit 0
+          fi
+          if curl -sSL --fail "$SPLASH_URL" -o desktop/splash.png; then
+            echo "Applied the uploaded splash screen"
+          else
+            echo "::warning::The splash screen could not be downloaded - the app starts without one."
           fi
 
       - name: Install desktop tools
@@ -1037,6 +1147,7 @@ jobs:
           MYAPPS_SCRIPT
           cat > desktop/main.js <<'JS'
           const { app, BrowserWindow, shell, protocol, session } = require('electron');
+          const fs = require('fs');
           const path = require('path');
           const config = require('./config.json');
           const local = require('./local-origin.cjs');
@@ -1048,11 +1159,27 @@ jobs:
             catch { return false; }
           };
           let localSession;
+          let splash;
+          // A splash window is shown only when the build shipped splash artwork.
+          function showSplash() {
+            if (verifying) return;
+            if (!fs.existsSync(path.join(__dirname, 'splash.png'))) return;
+            splash = new BrowserWindow({
+              width: 400, height: 660, frame: false, resizable: false, backgroundColor: '#ffffff',
+              webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+            });
+            splash.loadFile(path.join(__dirname, 'splash.html'));
+          }
+          function closeSplash() {
+            if (!splash) return;
+            if (!splash.isDestroyed()) splash.destroy();
+            splash = null;
+          }
           function createWindow() {
             const win = new BrowserWindow({
               width: 1200, height: 820, minWidth: 760, minHeight: 540,
               title: config.appName, autoHideMenuBar: true, backgroundColor: '#ffffff',
-              show: !verifying,
+              show: false,
               webPreferences: { session: localSession, contextIsolation: true, nodeIntegration: false, sandbox: true },
             });
             win.webContents.on('will-navigate', (event, url) => {
@@ -1065,6 +1192,10 @@ jobs:
               if (/^https?:/i.test(url)) shell.openExternal(url);
               return { action: 'deny' };
             });
+            win.once('ready-to-show', () => {
+              closeSplash();
+              if (!verifying) win.show();
+            });
             return win;
           }
           app.whenReady().then(async () => {
@@ -1073,6 +1204,7 @@ jobs:
               local.installLocalOrigin(localSession, path.join(__dirname, 'app'));
               console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED ' + local.ORIGIN);
             }
+            showSplash();
             const win = createWindow();
             if (verifying) {
               await require('./verify-bundle.cjs')(win, localSession, local.ORIGIN);
@@ -1084,6 +1216,20 @@ jobs:
             if (localSession && BrowserWindow.getAllWindows().length === 0) createWindow().loadURL(startUrl);
           });
           JS
+          cat > desktop/splash.html <<'HTML'
+          <!doctype html>
+          <html>
+            <head>
+              <meta charset="utf-8" />
+              <style>
+                html, body { margin: 0; height: 100%; background: #ffffff; }
+                body { display: flex; align-items: center; justify-content: center; }
+                img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+              </style>
+            </head>
+            <body><img src="splash.png" alt="" /></body>
+          </html>
+          HTML
           cat > desktop/package.json <<JSON
           {
             "name": "$SLUG",
@@ -1093,7 +1239,7 @@ jobs:
             "author": "MyApps Convertor",
             "description": "$APP_NAME",
             "build": {
-              "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "app/**/*"],
+              "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "splash.html", "splash.*", "app/**/*"],
               "appId": "com.myapps.$SLUG",
               "productName": "$APP_NAME",
               "directories": { "output": "dist" },
@@ -1293,6 +1439,25 @@ jobs:
             echo "Applied the uploaded app icon"
           else
             echo "::warning::The app icon could not be downloaded - using the default artwork."
+          fi
+
+      # A splash screen is applied where the desktop runtime shows one: the
+      # Electron shell paints it while the main window loads.
+      - name: Apply the splash screen
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          SPLASH_URL=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.splash_screen_url||""')
+          if [ -z "$SPLASH_URL" ]; then
+            echo "No splash screen was uploaded - the app opens straight into its window."
+            exit 0
+          fi
+          if curl -sSL --fail "$SPLASH_URL" -o desktop/splash.png; then
+            echo "Applied the uploaded splash screen"
+          else
+            echo "::warning::The splash screen could not be downloaded - the app starts without one."
           fi
 
       - name: Install desktop tools
