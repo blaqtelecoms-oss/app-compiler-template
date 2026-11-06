@@ -222,7 +222,9 @@ jobs:
                 // A stable base is essential when an SPA refreshes a nested route.
                 if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
                 if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
-                text = text.replace(/<head\b[^>]*>/i, '      - name: Compile the APK<base href="/">');
+                // A replacement function keeps the matched tag intact; "$&" is only a
+                // placeholder, so any text placed around it must never rely on expansion.
+                text = text.replace(/<head\b[^>]*>/i, (tag) => tag + '<base href="/">');
               }
               fs.writeFileSync(file, text);
             }
@@ -335,6 +337,350 @@ jobs:
             echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
           prepare_codebase "wrapper/www"
+          cat > /tmp/myapps-sync-runtime.js <<'MYAPPS_SCRIPT'
+          (function () {
+            var cfg = window.__MYAPPS_SYNC__ || {};
+            var QUEUE_KEY = 'myapps.sync.queue';
+            var CLIENT_KEY = 'myapps.sync.client';
+            var MAX_ITEMS = 200;
+            var MAX_ATTEMPTS = 5;
+            var status = 'idle';
+            var lastError = '';
+            var busy = false;
+            var chip = null;
+            var hideTimer = null;
+
+            function readQueue() {
+              try {
+                var raw = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+                return Array.isArray(raw) ? raw : [];
+              } catch (error) {
+                return [];
+              }
+            }
+
+            function saveQueue(items) {
+              try {
+                localStorage.setItem(QUEUE_KEY, JSON.stringify(items.slice(-MAX_ITEMS)));
+              } catch (error) {}
+            }
+
+            function clientId() {
+              var existing = '';
+              try {
+                existing = localStorage.getItem(CLIENT_KEY) || '';
+                if (!existing) {
+                  existing = 'c' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+                  localStorage.setItem(CLIENT_KEY, existing);
+                }
+              } catch (error) {
+                existing = 'c-anonymous';
+              }
+              return existing;
+            }
+
+            function online() {
+              return typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
+            }
+
+            function newId() {
+              return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+            }
+
+            function announce() {
+              try {
+                window.dispatchEvent(
+                  new CustomEvent('myapps:sync', {
+                    detail: { status: status, pending: readQueue().length, error: lastError, enabled: !!cfg.endpoint },
+                  })
+                );
+              } catch (error) {}
+            }
+
+            function label(state, pending) {
+              if (!cfg.endpoint) return state === 'offline' ? 'Offline - bundled app' : '';
+              if (state === 'offline') return pending ? 'Offline - ' + pending + ' waiting to sync' : 'Offline - changes saved on this device';
+              if (state === 'syncing') return 'Syncing ' + pending + ' change' + (pending === 1 ? '' : 's') + '...';
+              if (state === 'pending') return pending + ' change' + (pending === 1 ? '' : 's') + ' waiting to sync';
+              if (state === 'synced') return 'All changes synced';
+              if (state === 'failed') return 'Sync failed - tap to retry';
+              return '';
+            }
+
+            function ensureChip() {
+              if (chip || !document.body) return chip;
+              chip = document.createElement('div');
+              chip.id = 'myapps-sync-chip';
+              chip.setAttribute('role', 'status');
+              chip.setAttribute('aria-live', 'polite');
+              chip.style.cssText = [
+                'position:fixed', 'left:50%', 'transform:translateX(-50%)',
+                'bottom:calc(14px + env(safe-area-inset-bottom,0px))',
+                'z-index:2147483000', 'max-width:calc(100vw - 28px)',
+                'padding:7px 13px', 'border-radius:999px',
+                'font:600 12px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+                'background:rgba(17,24,39,0.92)', 'color:#fff', 'box-shadow:0 8px 22px -10px rgba(0,0,0,0.6)',
+                'opacity:0', 'transition:opacity 180ms ease', 'pointer-events:none', 'text-align:center',
+              ].join(';');
+              chip.addEventListener('click', function () {
+                if (cfg.endpoint) flush();
+              });
+              document.body.appendChild(chip);
+              return chip;
+            }
+
+            function render() {
+              var pending = readQueue().length;
+              if (!cfg.showStatus) return;
+              var text = label(status, pending);
+              var node = ensureChip();
+              if (!node) return;
+              if (!text) {
+                node.style.opacity = '0';
+                node.style.pointerEvents = 'none';
+                return;
+              }
+              node.textContent = text;
+              node.style.opacity = '1';
+              node.style.pointerEvents = status === 'failed' ? 'auto' : 'none';
+              node.style.cursor = status === 'failed' ? 'pointer' : 'default';
+              node.style.background = status === 'failed' ? 'rgba(185,28,28,0.94)' : 'rgba(17,24,39,0.92)';
+              if (hideTimer) clearTimeout(hideTimer);
+              if (status === 'synced') {
+                hideTimer = setTimeout(function () {
+                  if (chip) chip.style.opacity = '0';
+                }, 3000);
+              }
+            }
+
+            function drop(ids) {
+              var remove = {};
+              ids.forEach(function (id) {
+                remove[id] = true;
+              });
+              var kept = readQueue().filter(function (item) {
+                return !remove[item.id];
+              });
+              saveQueue(kept);
+              return kept;
+            }
+
+            function markAttempts(ids) {
+              var flagged = {};
+              ids.forEach(function (id) {
+                flagged[id] = true;
+              });
+              saveQueue(
+                readQueue().map(function (item) {
+                  if (!flagged[item.id]) return item;
+                  return Object.assign({}, item, { attempts: (item.attempts || 0) + 1 });
+                })
+              );
+            }
+
+            function flush() {
+              var queue = readQueue();
+              if (!cfg.endpoint || busy || !online() || queue.length === 0) {
+                if (queue.length && !online()) {
+                  status = 'offline';
+                  render();
+                  announce();
+                }
+                return Promise.resolve(false);
+              }
+
+              busy = true;
+              status = 'syncing';
+              lastError = '';
+              render();
+              announce();
+
+              var controller = typeof AbortController === 'function' ? new AbortController() : null;
+              var timeout = controller ? setTimeout(function () { controller.abort(); }, 15000) : null;
+
+              return fetch(cfg.endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                signal: controller ? controller.signal : undefined,
+                body: JSON.stringify({ client: clientId(), app: cfg.appName || '', operations: queue }),
+              })
+                .then(function (response) {
+                  if (!response.ok) throw new Error('The sync service answered ' + response.status + '.');
+                  return response.json().catch(function () { return {}; });
+                })
+                .then(function (result) {
+                  var acked = Array.isArray(result && result.acknowledged) ? result.acknowledged : queue.map(function (item) { return item.id; });
+                  var conflicts = Array.isArray(result && result.conflicts) ? result.conflicts : [];
+                  var rejected = Array.isArray(result && result.rejected) ? result.rejected : [];
+                  var kept = drop(acked.filter(function (id) { return conflicts.indexOf(id) === -1; }));
+                  if (conflicts.length || rejected.length) markAttempts(conflicts.concat(rejected));
+                  lastError = conflicts.length ? 'The service reported conflicting changes that were kept on this device.' : '';
+                  status = kept.length ? 'failed' : 'synced';
+                  return pull(kept.length);
+                })
+                .catch(function (error) {
+                  lastError = String((error && error.message) || 'The sync service could not be reached.');
+                  status = 'failed';
+                  announce();
+                  return false;
+                })
+                .then(function (result) {
+                  busy = false;
+                  if (timeout) clearTimeout(timeout);
+                  render();
+                  announce();
+                  return result;
+                });
+            }
+
+            function pull(keptPending) {
+              if (!cfg.pullPath) return keptPending;
+              return fetch(cfg.endpoint.replace(/\/+$/, '') + cfg.pullPath, { headers: { Accept: 'application/json' } })
+                .then(function (response) {
+                  return response.ok ? response.json() : null;
+                })
+                .then(function (data) {
+                  if (data) {
+                    try {
+                      window.dispatchEvent(new CustomEvent('myapps:sync:data', { detail: data }));
+                    } catch (error) {}
+                  }
+                  return keptPending;
+                })
+                .catch(function () {
+                  return keptPending;
+                });
+            }
+
+            function refresh() {
+              if (!online()) {
+                status = 'offline';
+                render();
+                announce();
+                return;
+              }
+              if (!cfg.endpoint) {
+                status = 'idle';
+                render();
+                announce();
+                return;
+              }
+              if (readQueue().length === 0) {
+                status = 'idle';
+                render();
+                announce();
+                return;
+              }
+              flush();
+            }
+
+            window.MyApps = window.MyApps || {};
+            window.MyApps.sync = {
+              enabled: function () { return !!cfg.endpoint; },
+              pending: function () { return readQueue().length; },
+              status: function () { return status; },
+              flush: flush,
+              push: function (operation) {
+                var op = operation || {};
+                var queue = readQueue();
+                var item = {
+                  id: op.id ? String(op.id) : newId(),
+                  path: String(op.path || '/'),
+                  method: String(op.method || 'POST').toUpperCase(),
+                  body: op.body === undefined ? null : op.body,
+                  at: new Date().toISOString(),
+                  attempts: 0,
+                };
+                queue.push(item);
+                saveQueue(queue);
+                status = online() ? 'pending' : 'offline';
+                render();
+                announce();
+                flush();
+                return item.id;
+              },
+              clear: function () {
+                saveQueue([]);
+                lastError = '';
+                status = online() ? 'idle' : 'offline';
+                render();
+                announce();
+              },
+            };
+
+            window.addEventListener('online', refresh);
+            window.addEventListener('offline', function () {
+              status = 'offline';
+              render();
+              announce();
+            });
+            document.addEventListener('visibilitychange', function () {
+              if (!document.hidden && online() && cfg.endpoint && readQueue().length) flush();
+            });
+            setInterval(function () {
+              if (cfg.endpoint && online() && readQueue().length && status !== 'syncing') flush();
+            }, 45000);
+            if (document.readyState === 'loading') {
+              document.addEventListener('DOMContentLoaded', refresh);
+            } else {
+              refresh();
+            }
+          })();
+          MYAPPS_SCRIPT
+          cat > /tmp/myapps-inject-sync.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          const payload = JSON.parse(process.env.PAYLOAD || '{}');
+          const config = payload.app_config || {};
+          const raw = String(config.sync_endpoint || '').trim();
+          const endpoint = /^https:\/\/\S{8,500}$/i.test(raw) ? raw : '';
+          const pullPath = /^\/[\w\-./?=&\u0025]{1,120}$/.test(String(config.sync_pull_path || '')) ? String(config.sync_pull_path) : '';
+          const entry = path.join(root, 'index.html');
+
+          if (!fs.existsSync(entry)) {
+            console.error('::error::The bundled site has no index.html.');
+            process.exit(1);
+          }
+
+          let html = fs.readFileSync(entry, 'utf8');
+          if (/^\s*-\s+name:\s/m.test(html) || html.indexOf('MYAPPS_SCRIPT') !== -1) {
+            console.error('::error::The archive produced build instructions instead of a website. Upload the built site (its dist folder), not the repository root.');
+            process.exit(1);
+          }
+          if (!/<html/i.test(html) || !/<body/i.test(html) || !/<head/i.test(html)) {
+            console.error('::error::index.html is not a browser page. Upload a build whose index.html opens in a browser.');
+            process.exit(1);
+          }
+
+          const titleMatch = html.match(/<title[^>]*>([^<]{0,120})<\/title>/i);
+          const title = titleMatch ? titleMatch[1].trim() : '';
+
+          fs.writeFileSync(path.join(root, 'myapps-sync.js'), fs.readFileSync('/tmp/myapps-sync-runtime.js', 'utf8'));
+          const bag = {
+            endpoint: endpoint,
+            pullPath: pullPath,
+            appName: String(config.app_name || payload.app_name || ''),
+            platform: String(config.platform || payload.platform || ''),
+            showStatus: true,
+          };
+          const injected = '<script>window.__MYAPPS_SYNC__=' + JSON.stringify(bag).replace(/</g, '\u003c') + ';</script>' +
+            '<script src="/myapps-sync.js" defer></script>';
+
+          if (html.indexOf('myapps-sync.js') === -1) {
+            html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, () => injected + '</body>') : html + injected;
+            fs.writeFileSync(entry, html);
+          }
+
+          const assets = (html.match(/<(?:script|link)\b[^>]*\b(?:src|href)\s*=/gi) || []).length;
+          console.log('MYAPPS_APP_ENTRYPOINT ' + JSON.stringify({
+            title: title.slice(0, 80),
+            assets: assets,
+            offline: true,
+            sync: !!endpoint,
+          }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-inject-sync.cjs wrapper/www
           cat > /tmp/myapps-configure-mobile.cjs <<'MYAPPS_SCRIPT'
           const fs = require('fs');
           const file = 'wrapper/capacitor.config.json';
@@ -384,10 +730,15 @@ jobs:
             }
           }
           verify(bundle);
-          assert.match(fs.readFileSync(path.join(nativeBundle, 'index.html'), 'utf8'), /<base href="\/">/);
+          const shippedHtml = fs.readFileSync(path.join(nativeBundle, 'index.html'), 'utf8');
+          assert.match(shippedHtml, /<base href="\/">/);
+          // The shipped page must be the app itself, with the offline sync runtime in it.
+          assert.ok(!/^\s*-\s+name:\s/m.test(shippedHtml), 'The shipped index.html holds compiler instructions instead of the app.');
+          assert.ok(!/MYAPPS_SCRIPT/.test(shippedHtml), 'The shipped index.html holds compiler instructions instead of the app.');
+          assert.match(shippedHtml, /myapps-sync\.js/, 'The offline sync runtime is missing from the shipped app.');
           // Verify the generated app, not private Capacitor source formatting. Constructor
           // arguments and native source paths can change without changing server behavior.
-          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, nativeAssets: true }));
+          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, nativeAssets: true, entry: true, syncRuntime: true }));
           MYAPPS_SCRIPT
           PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
           node /tmp/myapps-verify-mobile.cjs "$PLATFORM"
@@ -511,7 +862,9 @@ jobs:
                 // A stable base is essential when an SPA refreshes a nested route.
                 if (/<base\b/i.test(text)) text = text.replace(/<base\b[^>]*>/gi, '');
                 if (!/<head\b[^>]*>/i.test(text)) throw new Error('index.html needs a head element.');
-                text = text.replace(/<head\b[^>]*>/i, '      - name: Report that iOS signing is not configured<base href="/">');
+                // A replacement function keeps the matched tag intact; "$&" is only a
+                // placeholder, so any text placed around it must never rely on expansion.
+                text = text.replace(/<head\b[^>]*>/i, (tag) => tag + '<base href="/">');
               }
               fs.writeFileSync(file, text);
             }
@@ -624,6 +977,350 @@ jobs:
             echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
           prepare_codebase "wrapper/www"
+          cat > /tmp/myapps-sync-runtime.js <<'MYAPPS_SCRIPT'
+          (function () {
+            var cfg = window.__MYAPPS_SYNC__ || {};
+            var QUEUE_KEY = 'myapps.sync.queue';
+            var CLIENT_KEY = 'myapps.sync.client';
+            var MAX_ITEMS = 200;
+            var MAX_ATTEMPTS = 5;
+            var status = 'idle';
+            var lastError = '';
+            var busy = false;
+            var chip = null;
+            var hideTimer = null;
+
+            function readQueue() {
+              try {
+                var raw = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+                return Array.isArray(raw) ? raw : [];
+              } catch (error) {
+                return [];
+              }
+            }
+
+            function saveQueue(items) {
+              try {
+                localStorage.setItem(QUEUE_KEY, JSON.stringify(items.slice(-MAX_ITEMS)));
+              } catch (error) {}
+            }
+
+            function clientId() {
+              var existing = '';
+              try {
+                existing = localStorage.getItem(CLIENT_KEY) || '';
+                if (!existing) {
+                  existing = 'c' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+                  localStorage.setItem(CLIENT_KEY, existing);
+                }
+              } catch (error) {
+                existing = 'c-anonymous';
+              }
+              return existing;
+            }
+
+            function online() {
+              return typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
+            }
+
+            function newId() {
+              return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+            }
+
+            function announce() {
+              try {
+                window.dispatchEvent(
+                  new CustomEvent('myapps:sync', {
+                    detail: { status: status, pending: readQueue().length, error: lastError, enabled: !!cfg.endpoint },
+                  })
+                );
+              } catch (error) {}
+            }
+
+            function label(state, pending) {
+              if (!cfg.endpoint) return state === 'offline' ? 'Offline - bundled app' : '';
+              if (state === 'offline') return pending ? 'Offline - ' + pending + ' waiting to sync' : 'Offline - changes saved on this device';
+              if (state === 'syncing') return 'Syncing ' + pending + ' change' + (pending === 1 ? '' : 's') + '...';
+              if (state === 'pending') return pending + ' change' + (pending === 1 ? '' : 's') + ' waiting to sync';
+              if (state === 'synced') return 'All changes synced';
+              if (state === 'failed') return 'Sync failed - tap to retry';
+              return '';
+            }
+
+            function ensureChip() {
+              if (chip || !document.body) return chip;
+              chip = document.createElement('div');
+              chip.id = 'myapps-sync-chip';
+              chip.setAttribute('role', 'status');
+              chip.setAttribute('aria-live', 'polite');
+              chip.style.cssText = [
+                'position:fixed', 'left:50%', 'transform:translateX(-50%)',
+                'bottom:calc(14px + env(safe-area-inset-bottom,0px))',
+                'z-index:2147483000', 'max-width:calc(100vw - 28px)',
+                'padding:7px 13px', 'border-radius:999px',
+                'font:600 12px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+                'background:rgba(17,24,39,0.92)', 'color:#fff', 'box-shadow:0 8px 22px -10px rgba(0,0,0,0.6)',
+                'opacity:0', 'transition:opacity 180ms ease', 'pointer-events:none', 'text-align:center',
+              ].join(';');
+              chip.addEventListener('click', function () {
+                if (cfg.endpoint) flush();
+              });
+              document.body.appendChild(chip);
+              return chip;
+            }
+
+            function render() {
+              var pending = readQueue().length;
+              if (!cfg.showStatus) return;
+              var text = label(status, pending);
+              var node = ensureChip();
+              if (!node) return;
+              if (!text) {
+                node.style.opacity = '0';
+                node.style.pointerEvents = 'none';
+                return;
+              }
+              node.textContent = text;
+              node.style.opacity = '1';
+              node.style.pointerEvents = status === 'failed' ? 'auto' : 'none';
+              node.style.cursor = status === 'failed' ? 'pointer' : 'default';
+              node.style.background = status === 'failed' ? 'rgba(185,28,28,0.94)' : 'rgba(17,24,39,0.92)';
+              if (hideTimer) clearTimeout(hideTimer);
+              if (status === 'synced') {
+                hideTimer = setTimeout(function () {
+                  if (chip) chip.style.opacity = '0';
+                }, 3000);
+              }
+            }
+
+            function drop(ids) {
+              var remove = {};
+              ids.forEach(function (id) {
+                remove[id] = true;
+              });
+              var kept = readQueue().filter(function (item) {
+                return !remove[item.id];
+              });
+              saveQueue(kept);
+              return kept;
+            }
+
+            function markAttempts(ids) {
+              var flagged = {};
+              ids.forEach(function (id) {
+                flagged[id] = true;
+              });
+              saveQueue(
+                readQueue().map(function (item) {
+                  if (!flagged[item.id]) return item;
+                  return Object.assign({}, item, { attempts: (item.attempts || 0) + 1 });
+                })
+              );
+            }
+
+            function flush() {
+              var queue = readQueue();
+              if (!cfg.endpoint || busy || !online() || queue.length === 0) {
+                if (queue.length && !online()) {
+                  status = 'offline';
+                  render();
+                  announce();
+                }
+                return Promise.resolve(false);
+              }
+
+              busy = true;
+              status = 'syncing';
+              lastError = '';
+              render();
+              announce();
+
+              var controller = typeof AbortController === 'function' ? new AbortController() : null;
+              var timeout = controller ? setTimeout(function () { controller.abort(); }, 15000) : null;
+
+              return fetch(cfg.endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                signal: controller ? controller.signal : undefined,
+                body: JSON.stringify({ client: clientId(), app: cfg.appName || '', operations: queue }),
+              })
+                .then(function (response) {
+                  if (!response.ok) throw new Error('The sync service answered ' + response.status + '.');
+                  return response.json().catch(function () { return {}; });
+                })
+                .then(function (result) {
+                  var acked = Array.isArray(result && result.acknowledged) ? result.acknowledged : queue.map(function (item) { return item.id; });
+                  var conflicts = Array.isArray(result && result.conflicts) ? result.conflicts : [];
+                  var rejected = Array.isArray(result && result.rejected) ? result.rejected : [];
+                  var kept = drop(acked.filter(function (id) { return conflicts.indexOf(id) === -1; }));
+                  if (conflicts.length || rejected.length) markAttempts(conflicts.concat(rejected));
+                  lastError = conflicts.length ? 'The service reported conflicting changes that were kept on this device.' : '';
+                  status = kept.length ? 'failed' : 'synced';
+                  return pull(kept.length);
+                })
+                .catch(function (error) {
+                  lastError = String((error && error.message) || 'The sync service could not be reached.');
+                  status = 'failed';
+                  announce();
+                  return false;
+                })
+                .then(function (result) {
+                  busy = false;
+                  if (timeout) clearTimeout(timeout);
+                  render();
+                  announce();
+                  return result;
+                });
+            }
+
+            function pull(keptPending) {
+              if (!cfg.pullPath) return keptPending;
+              return fetch(cfg.endpoint.replace(/\/+$/, '') + cfg.pullPath, { headers: { Accept: 'application/json' } })
+                .then(function (response) {
+                  return response.ok ? response.json() : null;
+                })
+                .then(function (data) {
+                  if (data) {
+                    try {
+                      window.dispatchEvent(new CustomEvent('myapps:sync:data', { detail: data }));
+                    } catch (error) {}
+                  }
+                  return keptPending;
+                })
+                .catch(function () {
+                  return keptPending;
+                });
+            }
+
+            function refresh() {
+              if (!online()) {
+                status = 'offline';
+                render();
+                announce();
+                return;
+              }
+              if (!cfg.endpoint) {
+                status = 'idle';
+                render();
+                announce();
+                return;
+              }
+              if (readQueue().length === 0) {
+                status = 'idle';
+                render();
+                announce();
+                return;
+              }
+              flush();
+            }
+
+            window.MyApps = window.MyApps || {};
+            window.MyApps.sync = {
+              enabled: function () { return !!cfg.endpoint; },
+              pending: function () { return readQueue().length; },
+              status: function () { return status; },
+              flush: flush,
+              push: function (operation) {
+                var op = operation || {};
+                var queue = readQueue();
+                var item = {
+                  id: op.id ? String(op.id) : newId(),
+                  path: String(op.path || '/'),
+                  method: String(op.method || 'POST').toUpperCase(),
+                  body: op.body === undefined ? null : op.body,
+                  at: new Date().toISOString(),
+                  attempts: 0,
+                };
+                queue.push(item);
+                saveQueue(queue);
+                status = online() ? 'pending' : 'offline';
+                render();
+                announce();
+                flush();
+                return item.id;
+              },
+              clear: function () {
+                saveQueue([]);
+                lastError = '';
+                status = online() ? 'idle' : 'offline';
+                render();
+                announce();
+              },
+            };
+
+            window.addEventListener('online', refresh);
+            window.addEventListener('offline', function () {
+              status = 'offline';
+              render();
+              announce();
+            });
+            document.addEventListener('visibilitychange', function () {
+              if (!document.hidden && online() && cfg.endpoint && readQueue().length) flush();
+            });
+            setInterval(function () {
+              if (cfg.endpoint && online() && readQueue().length && status !== 'syncing') flush();
+            }, 45000);
+            if (document.readyState === 'loading') {
+              document.addEventListener('DOMContentLoaded', refresh);
+            } else {
+              refresh();
+            }
+          })();
+          MYAPPS_SCRIPT
+          cat > /tmp/myapps-inject-sync.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          const payload = JSON.parse(process.env.PAYLOAD || '{}');
+          const config = payload.app_config || {};
+          const raw = String(config.sync_endpoint || '').trim();
+          const endpoint = /^https:\/\/\S{8,500}$/i.test(raw) ? raw : '';
+          const pullPath = /^\/[\w\-./?=&\u0025]{1,120}$/.test(String(config.sync_pull_path || '')) ? String(config.sync_pull_path) : '';
+          const entry = path.join(root, 'index.html');
+
+          if (!fs.existsSync(entry)) {
+            console.error('::error::The bundled site has no index.html.');
+            process.exit(1);
+          }
+
+          let html = fs.readFileSync(entry, 'utf8');
+          if (/^\s*-\s+name:\s/m.test(html) || html.indexOf('MYAPPS_SCRIPT') !== -1) {
+            console.error('::error::The archive produced build instructions instead of a website. Upload the built site (its dist folder), not the repository root.');
+            process.exit(1);
+          }
+          if (!/<html/i.test(html) || !/<body/i.test(html) || !/<head/i.test(html)) {
+            console.error('::error::index.html is not a browser page. Upload a build whose index.html opens in a browser.');
+            process.exit(1);
+          }
+
+          const titleMatch = html.match(/<title[^>]*>([^<]{0,120})<\/title>/i);
+          const title = titleMatch ? titleMatch[1].trim() : '';
+
+          fs.writeFileSync(path.join(root, 'myapps-sync.js'), fs.readFileSync('/tmp/myapps-sync-runtime.js', 'utf8'));
+          const bag = {
+            endpoint: endpoint,
+            pullPath: pullPath,
+            appName: String(config.app_name || payload.app_name || ''),
+            platform: String(config.platform || payload.platform || ''),
+            showStatus: true,
+          };
+          const injected = '<script>window.__MYAPPS_SYNC__=' + JSON.stringify(bag).replace(/</g, '\u003c') + ';</script>' +
+            '<script src="/myapps-sync.js" defer></script>';
+
+          if (html.indexOf('myapps-sync.js') === -1) {
+            html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, () => injected + '</body>') : html + injected;
+            fs.writeFileSync(entry, html);
+          }
+
+          const assets = (html.match(/<(?:script|link)\b[^>]*\b(?:src|href)\s*=/gi) || []).length;
+          console.log('MYAPPS_APP_ENTRYPOINT ' + JSON.stringify({
+            title: title.slice(0, 80),
+            assets: assets,
+            offline: true,
+            sync: !!endpoint,
+          }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-inject-sync.cjs wrapper/www
           cat > /tmp/myapps-configure-mobile.cjs <<'MYAPPS_SCRIPT'
           const fs = require('fs');
           const file = 'wrapper/capacitor.config.json';
@@ -673,10 +1370,15 @@ jobs:
             }
           }
           verify(bundle);
-          assert.match(fs.readFileSync(path.join(nativeBundle, 'index.html'), 'utf8'), /<base href="\/">/);
+          const shippedHtml = fs.readFileSync(path.join(nativeBundle, 'index.html'), 'utf8');
+          assert.match(shippedHtml, /<base href="\/">/);
+          // The shipped page must be the app itself, with the offline sync runtime in it.
+          assert.ok(!/^\s*-\s+name:\s/m.test(shippedHtml), 'The shipped index.html holds compiler instructions instead of the app.');
+          assert.ok(!/MYAPPS_SCRIPT/.test(shippedHtml), 'The shipped index.html holds compiler instructions instead of the app.');
+          assert.match(shippedHtml, /myapps-sync\.js/, 'The offline sync runtime is missing from the shipped app.');
           // Verify the generated app, not private Capacitor source formatting. Constructor
           // arguments and native source paths can change without changing server behavior.
-          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, nativeAssets: true }));
+          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, nativeAssets: true, entry: true, syncRuntime: true }));
           MYAPPS_SCRIPT
           PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
           node /tmp/myapps-verify-mobile.cjs "$PLATFORM"
