@@ -1,0 +1,405 @@
+name: Build desktop app
+
+on:
+  repository_dispatch:
+    types: [build_desktop_app]
+
+permissions:
+  contents: write
+
+env:
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+jobs:
+  windows:
+    if: github.event.client_payload.platform == 'windows'
+    runs-on: windows-latest
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create the desktop shell
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          mkdir -p desktop
+          APP_NAME=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); (p.app_name||"Desktop App").slice(0,60)')
+          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url')
+          SLUG=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); String(p.app_name||"app").toLowerCase().replace(/[^a-z0-9]+/g,"")||"app"')
+          cat > desktop/config.json <<JSON
+          {
+            "targetUrl": "$TARGET_URL",
+            "appName": "$APP_NAME"
+          }
+          JSON
+          cat > desktop/main.js <<'JS'
+          const { app, BrowserWindow, shell } = require('electron');
+          const config = require('./config.json');
+          const origin = new URL(config.targetUrl).origin;
+
+          function createWindow() {
+            const win = new BrowserWindow({
+              width: 1200,
+              height: 820,
+              minWidth: 760,
+              minHeight: 540,
+              title: config.appName,
+              autoHideMenuBar: true,
+              backgroundColor: '#ffffff',
+              webPreferences: { contextIsolation: true, nodeIntegration: false },
+            });
+            win.loadURL(config.targetUrl);
+            win.webContents.setWindowOpenHandler(({ url }) => {
+              shell.openExternal(url);
+              return { action: 'deny' };
+            });
+            win.webContents.on('will-navigate', (event, url) => {
+              if (!url.startsWith(origin)) {
+                event.preventDefault();
+                shell.openExternal(url);
+              }
+            });
+          }
+
+          app.whenReady().then(createWindow);
+          app.on('window-all-closed', () => {
+            if (process.platform !== 'darwin') app.quit();
+          });
+          app.on('activate', () => {
+            if (BrowserWindow.getAllWindows().length === 0) createWindow();
+          });
+          JS
+          cat > desktop/package.json <<JSON
+          {
+            "name": "$SLUG",
+            "productName": "$APP_NAME",
+            "version": "1.0.0",
+            "main": "main.js",
+            "author": "MyApps Convertor",
+            "description": "$APP_NAME",
+            "build": {
+              "appId": "com.myapps.$SLUG",
+              "productName": "$APP_NAME",
+              "directories": { "output": "dist" },
+              "win": { "target": "nsis" },
+              "mac": { "target": "dmg", "category": "public.app-category.productivity" },
+              "linux": { "target": "AppImage", "category": "Utility" }
+            },
+            "devDependencies": { "electron": "^33.0.0", "electron-builder": "^25.0.0" }
+          }
+          JSON
+          node -e 'JSON.parse(require("fs").readFileSync("desktop/package.json","utf8"))'
+          echo "Desktop shell ready for $APP_NAME"
+
+      - name: Package the installer
+        shell: bash
+        working-directory: desktop
+        run: |
+          npm install --no-audit --no-fund
+          npx electron-builder --win nsis --publish never
+
+      - name: Publish the installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          TAG=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").release_tag')
+          BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
+          FILE=$(ls desktop/dist/*.exe | head -n 1)
+          NAME=$(basename "$FILE")
+          gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
+          echo "FILE_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "ARTIFACT_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/$NAME" >> "$GITHUB_ENV"
+          echo "Published $NAME"
+
+      - name: Tell MyApps the build succeeded
+        if: success()
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform')
+          curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "x-webhook-secret: $WEBHOOK_SECRET" -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"platform\":\"$PLATFORM\",\"status\":\"success\",\"artifact_url\":\"$ARTIFACT_URL\",\"file_name\":\"$FILE_NAME\"}"
+
+      - name: Tell MyApps the build failed
+        if: failure()
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform')
+          curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "x-webhook-secret: $WEBHOOK_SECRET" -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"platform\":\"$PLATFORM\",\"status\":\"failed\",\"message\":\"The desktop compiler stopped - open the Actions log for this run.\"}"
+
+  macos:
+    if: github.event.client_payload.platform == 'macos'
+    runs-on: macos-latest
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create the desktop shell
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          mkdir -p desktop
+          APP_NAME=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); (p.app_name||"Desktop App").slice(0,60)')
+          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url')
+          SLUG=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); String(p.app_name||"app").toLowerCase().replace(/[^a-z0-9]+/g,"")||"app"')
+          cat > desktop/config.json <<JSON
+          {
+            "targetUrl": "$TARGET_URL",
+            "appName": "$APP_NAME"
+          }
+          JSON
+          cat > desktop/main.js <<'JS'
+          const { app, BrowserWindow, shell } = require('electron');
+          const config = require('./config.json');
+          const origin = new URL(config.targetUrl).origin;
+
+          function createWindow() {
+            const win = new BrowserWindow({
+              width: 1200,
+              height: 820,
+              minWidth: 760,
+              minHeight: 540,
+              title: config.appName,
+              autoHideMenuBar: true,
+              backgroundColor: '#ffffff',
+              webPreferences: { contextIsolation: true, nodeIntegration: false },
+            });
+            win.loadURL(config.targetUrl);
+            win.webContents.setWindowOpenHandler(({ url }) => {
+              shell.openExternal(url);
+              return { action: 'deny' };
+            });
+            win.webContents.on('will-navigate', (event, url) => {
+              if (!url.startsWith(origin)) {
+                event.preventDefault();
+                shell.openExternal(url);
+              }
+            });
+          }
+
+          app.whenReady().then(createWindow);
+          app.on('window-all-closed', () => {
+            if (process.platform !== 'darwin') app.quit();
+          });
+          app.on('activate', () => {
+            if (BrowserWindow.getAllWindows().length === 0) createWindow();
+          });
+          JS
+          cat > desktop/package.json <<JSON
+          {
+            "name": "$SLUG",
+            "productName": "$APP_NAME",
+            "version": "1.0.0",
+            "main": "main.js",
+            "author": "MyApps Convertor",
+            "description": "$APP_NAME",
+            "build": {
+              "appId": "com.myapps.$SLUG",
+              "productName": "$APP_NAME",
+              "directories": { "output": "dist" },
+              "win": { "target": "nsis" },
+              "mac": { "target": "dmg", "category": "public.app-category.productivity" },
+              "linux": { "target": "AppImage", "category": "Utility" }
+            },
+            "devDependencies": { "electron": "^33.0.0", "electron-builder": "^25.0.0" }
+          }
+          JSON
+          node -e 'JSON.parse(require("fs").readFileSync("desktop/package.json","utf8"))'
+          echo "Desktop shell ready for $APP_NAME"
+
+      - name: Package the installer
+        shell: bash
+        working-directory: desktop
+        run: |
+          npm install --no-audit --no-fund
+          npx electron-builder --mac dmg --publish never
+
+      - name: Publish the installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          TAG=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").release_tag')
+          BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
+          FILE=$(ls desktop/dist/*.dmg | head -n 1)
+          NAME=$(basename "$FILE")
+          gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
+          echo "FILE_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "ARTIFACT_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/$NAME" >> "$GITHUB_ENV"
+          echo "Published $NAME"
+
+      - name: Tell MyApps the build succeeded
+        if: success()
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform')
+          curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "x-webhook-secret: $WEBHOOK_SECRET" -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"platform\":\"$PLATFORM\",\"status\":\"success\",\"artifact_url\":\"$ARTIFACT_URL\",\"file_name\":\"$FILE_NAME\"}"
+
+      - name: Tell MyApps the build failed
+        if: failure()
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform')
+          curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "x-webhook-secret: $WEBHOOK_SECRET" -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"platform\":\"$PLATFORM\",\"status\":\"failed\",\"message\":\"The desktop compiler stopped - open the Actions log for this run.\"}"
+
+  linux:
+    if: github.event.client_payload.platform == 'linux'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create the desktop shell
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          mkdir -p desktop
+          APP_NAME=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); (p.app_name||"Desktop App").slice(0,60)')
+          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url')
+          SLUG=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); String(p.app_name||"app").toLowerCase().replace(/[^a-z0-9]+/g,"")||"app"')
+          cat > desktop/config.json <<JSON
+          {
+            "targetUrl": "$TARGET_URL",
+            "appName": "$APP_NAME"
+          }
+          JSON
+          cat > desktop/main.js <<'JS'
+          const { app, BrowserWindow, shell } = require('electron');
+          const config = require('./config.json');
+          const origin = new URL(config.targetUrl).origin;
+
+          function createWindow() {
+            const win = new BrowserWindow({
+              width: 1200,
+              height: 820,
+              minWidth: 760,
+              minHeight: 540,
+              title: config.appName,
+              autoHideMenuBar: true,
+              backgroundColor: '#ffffff',
+              webPreferences: { contextIsolation: true, nodeIntegration: false },
+            });
+            win.loadURL(config.targetUrl);
+            win.webContents.setWindowOpenHandler(({ url }) => {
+              shell.openExternal(url);
+              return { action: 'deny' };
+            });
+            win.webContents.on('will-navigate', (event, url) => {
+              if (!url.startsWith(origin)) {
+                event.preventDefault();
+                shell.openExternal(url);
+              }
+            });
+          }
+
+          app.whenReady().then(createWindow);
+          app.on('window-all-closed', () => {
+            if (process.platform !== 'darwin') app.quit();
+          });
+          app.on('activate', () => {
+            if (BrowserWindow.getAllWindows().length === 0) createWindow();
+          });
+          JS
+          cat > desktop/package.json <<JSON
+          {
+            "name": "$SLUG",
+            "productName": "$APP_NAME",
+            "version": "1.0.0",
+            "main": "main.js",
+            "author": "MyApps Convertor",
+            "description": "$APP_NAME",
+            "build": {
+              "appId": "com.myapps.$SLUG",
+              "productName": "$APP_NAME",
+              "directories": { "output": "dist" },
+              "win": { "target": "nsis" },
+              "mac": { "target": "dmg", "category": "public.app-category.productivity" },
+              "linux": { "target": "AppImage", "category": "Utility" }
+            },
+            "devDependencies": { "electron": "^33.0.0", "electron-builder": "^25.0.0" }
+          }
+          JSON
+          node -e 'JSON.parse(require("fs").readFileSync("desktop/package.json","utf8"))'
+          echo "Desktop shell ready for $APP_NAME"
+
+      - name: Package the installer
+        shell: bash
+        working-directory: desktop
+        run: |
+          npm install --no-audit --no-fund
+          npx electron-builder --linux AppImage --publish never
+
+      - name: Publish the installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          TAG=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").release_tag')
+          BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
+          FILE=$(ls desktop/dist/*.AppImage | head -n 1)
+          NAME=$(basename "$FILE")
+          gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
+          echo "FILE_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "ARTIFACT_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/$NAME" >> "$GITHUB_ENV"
+          echo "Published $NAME"
+
+      - name: Tell MyApps the build succeeded
+        if: success()
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform')
+          curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "x-webhook-secret: $WEBHOOK_SECRET" -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"platform\":\"$PLATFORM\",\"status\":\"success\",\"artifact_url\":\"$ARTIFACT_URL\",\"file_name\":\"$FILE_NAME\"}"
+
+      - name: Tell MyApps the build failed
+        if: failure()
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform')
+          curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "x-webhook-secret: $WEBHOOK_SECRET" -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"platform\":\"$PLATFORM\",\"status\":\"failed\",\"message\":\"The desktop compiler stopped - open the Actions log for this run.\"}"
