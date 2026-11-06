@@ -26,9 +26,9 @@ jobs:
           PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           set -euo pipefail
-          mkdir -p desktop
+          mkdir -p desktop/app
           APP_NAME=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); (p.app_name||"Desktop App").slice(0,60)')
-          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url')
+          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url||""')
           SLUG=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); String(p.app_name||"app").toLowerCase().replace(/[^a-z0-9]+/g,"")||"app"')
           cat > desktop/config.json <<JSON
           {
@@ -38,8 +38,9 @@ jobs:
           JSON
           cat > desktop/main.js <<'JS'
           const { app, BrowserWindow, shell } = require('electron');
+          const path = require('path');
           const config = require('./config.json');
-          const origin = new URL(config.targetUrl).origin;
+          const origin = config.targetUrl ? new URL(config.targetUrl).origin : '';
 
           function createWindow() {
             const win = new BrowserWindow({
@@ -52,16 +53,21 @@ jobs:
               backgroundColor: '#ffffff',
               webPreferences: { contextIsolation: true, nodeIntegration: false },
             });
-            win.loadURL(config.targetUrl);
+            if (config.targetUrl) {
+              win.loadURL(config.targetUrl);
+              win.webContents.on('will-navigate', (event, url) => {
+                if (!url.startsWith(origin)) {
+                  event.preventDefault();
+                  shell.openExternal(url);
+                }
+              });
+            } else {
+              // Codebase build: the site's files are shipped inside the app.
+              win.loadFile(path.join(__dirname, 'app', 'index.html'));
+            }
             win.webContents.setWindowOpenHandler(({ url }) => {
-              shell.openExternal(url);
+              if (/^https?:/i.test(url)) shell.openExternal(url);
               return { action: 'deny' };
-            });
-            win.webContents.on('will-navigate', (event, url) => {
-              if (!url.startsWith(origin)) {
-                event.preventDefault();
-                shell.openExternal(url);
-              }
             });
           }
 
@@ -81,6 +87,7 @@ jobs:
             "main": "main.js",
             "author": "MyApps Convertor",
             "description": "$APP_NAME",
+            "files": ["main.js", "config.json", "app/**/*"],
             "build": {
               "appId": "com.myapps.$SLUG",
               "productName": "$APP_NAME",
@@ -94,6 +101,47 @@ jobs:
           JSON
           node -e 'JSON.parse(require("fs").readFileSync("desktop/package.json","utf8"))'
           echo "Desktop shell ready for $APP_NAME"
+
+      - name: Unpack the uploaded codebase
+        if: github.event.client_payload.build_type == 'zip'
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
+          if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
+          unpack_codebase() {
+            local dest="$1"
+            local dl="/tmp/myapps-codebase.zip"
+            local work="/tmp/myapps-codebase"
+            command -v curl >/dev/null 2>&1 || { echo "::error::curl is not available."; exit 1; }
+            rm -rf "$work" && mkdir -p "$work"
+            curl -sSL --fail "$ZIP_URL" -o "$dl"
+            if [ "${RUNNER_OS:-Linux}" = "Windows" ]; then
+              local dl_win work_win
+              dl_win=$(cygpath -w "$dl")
+              work_win=$(cygpath -w "$work")
+              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$dl_win' -DestinationPath '$work_win' -Force"
+            else
+              unzip -q "$dl" -d "$work"
+            fi
+            local root="$work"
+            local nested=""
+            if [ ! -f "$root/index.html" ]; then
+              nested=$(find "$work" -maxdepth 3 -name index.html -print -quit)
+              if [ -n "$nested" ]; then root=$(dirname "$nested"); fi
+            fi
+            if [ ! -f "$root/index.html" ]; then
+              echo "::error::The archive does not contain an index.html. Zip the built site with index.html at its root."
+              exit 1
+            fi
+            rm -rf "$dest" && mkdir -p "$dest"
+            cp -R "$root/." "$dest/"
+            echo "Bundled the uploaded codebase from $ZIP_URL"
+          }
+          unpack_codebase "desktop/app"
+          echo "The installers ship the app files, so they run without a connection."
 
       - name: Package the installer
         shell: bash
@@ -167,9 +215,9 @@ jobs:
           PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           set -euo pipefail
-          mkdir -p desktop
+          mkdir -p desktop/app
           APP_NAME=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); (p.app_name||"Desktop App").slice(0,60)')
-          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url')
+          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url||""')
           SLUG=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); String(p.app_name||"app").toLowerCase().replace(/[^a-z0-9]+/g,"")||"app"')
           cat > desktop/config.json <<JSON
           {
@@ -179,8 +227,9 @@ jobs:
           JSON
           cat > desktop/main.js <<'JS'
           const { app, BrowserWindow, shell } = require('electron');
+          const path = require('path');
           const config = require('./config.json');
-          const origin = new URL(config.targetUrl).origin;
+          const origin = config.targetUrl ? new URL(config.targetUrl).origin : '';
 
           function createWindow() {
             const win = new BrowserWindow({
@@ -193,16 +242,21 @@ jobs:
               backgroundColor: '#ffffff',
               webPreferences: { contextIsolation: true, nodeIntegration: false },
             });
-            win.loadURL(config.targetUrl);
+            if (config.targetUrl) {
+              win.loadURL(config.targetUrl);
+              win.webContents.on('will-navigate', (event, url) => {
+                if (!url.startsWith(origin)) {
+                  event.preventDefault();
+                  shell.openExternal(url);
+                }
+              });
+            } else {
+              // Codebase build: the site's files are shipped inside the app.
+              win.loadFile(path.join(__dirname, 'app', 'index.html'));
+            }
             win.webContents.setWindowOpenHandler(({ url }) => {
-              shell.openExternal(url);
+              if (/^https?:/i.test(url)) shell.openExternal(url);
               return { action: 'deny' };
-            });
-            win.webContents.on('will-navigate', (event, url) => {
-              if (!url.startsWith(origin)) {
-                event.preventDefault();
-                shell.openExternal(url);
-              }
             });
           }
 
@@ -222,6 +276,7 @@ jobs:
             "main": "main.js",
             "author": "MyApps Convertor",
             "description": "$APP_NAME",
+            "files": ["main.js", "config.json", "app/**/*"],
             "build": {
               "appId": "com.myapps.$SLUG",
               "productName": "$APP_NAME",
@@ -235,6 +290,47 @@ jobs:
           JSON
           node -e 'JSON.parse(require("fs").readFileSync("desktop/package.json","utf8"))'
           echo "Desktop shell ready for $APP_NAME"
+
+      - name: Unpack the uploaded codebase
+        if: github.event.client_payload.build_type == 'zip'
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
+          if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
+          unpack_codebase() {
+            local dest="$1"
+            local dl="/tmp/myapps-codebase.zip"
+            local work="/tmp/myapps-codebase"
+            command -v curl >/dev/null 2>&1 || { echo "::error::curl is not available."; exit 1; }
+            rm -rf "$work" && mkdir -p "$work"
+            curl -sSL --fail "$ZIP_URL" -o "$dl"
+            if [ "${RUNNER_OS:-Linux}" = "Windows" ]; then
+              local dl_win work_win
+              dl_win=$(cygpath -w "$dl")
+              work_win=$(cygpath -w "$work")
+              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$dl_win' -DestinationPath '$work_win' -Force"
+            else
+              unzip -q "$dl" -d "$work"
+            fi
+            local root="$work"
+            local nested=""
+            if [ ! -f "$root/index.html" ]; then
+              nested=$(find "$work" -maxdepth 3 -name index.html -print -quit)
+              if [ -n "$nested" ]; then root=$(dirname "$nested"); fi
+            fi
+            if [ ! -f "$root/index.html" ]; then
+              echo "::error::The archive does not contain an index.html. Zip the built site with index.html at its root."
+              exit 1
+            fi
+            rm -rf "$dest" && mkdir -p "$dest"
+            cp -R "$root/." "$dest/"
+            echo "Bundled the uploaded codebase from $ZIP_URL"
+          }
+          unpack_codebase "desktop/app"
+          echo "The installers ship the app files, so they run without a connection."
 
       - name: Package the installer
         shell: bash
@@ -308,9 +404,9 @@ jobs:
           PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           set -euo pipefail
-          mkdir -p desktop
+          mkdir -p desktop/app
           APP_NAME=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); (p.app_name||"Desktop App").slice(0,60)')
-          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url')
+          TARGET_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); p.target_url||""')
           SLUG=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}"); String(p.app_name||"app").toLowerCase().replace(/[^a-z0-9]+/g,"")||"app"')
           cat > desktop/config.json <<JSON
           {
@@ -320,8 +416,9 @@ jobs:
           JSON
           cat > desktop/main.js <<'JS'
           const { app, BrowserWindow, shell } = require('electron');
+          const path = require('path');
           const config = require('./config.json');
-          const origin = new URL(config.targetUrl).origin;
+          const origin = config.targetUrl ? new URL(config.targetUrl).origin : '';
 
           function createWindow() {
             const win = new BrowserWindow({
@@ -334,16 +431,21 @@ jobs:
               backgroundColor: '#ffffff',
               webPreferences: { contextIsolation: true, nodeIntegration: false },
             });
-            win.loadURL(config.targetUrl);
+            if (config.targetUrl) {
+              win.loadURL(config.targetUrl);
+              win.webContents.on('will-navigate', (event, url) => {
+                if (!url.startsWith(origin)) {
+                  event.preventDefault();
+                  shell.openExternal(url);
+                }
+              });
+            } else {
+              // Codebase build: the site's files are shipped inside the app.
+              win.loadFile(path.join(__dirname, 'app', 'index.html'));
+            }
             win.webContents.setWindowOpenHandler(({ url }) => {
-              shell.openExternal(url);
+              if (/^https?:/i.test(url)) shell.openExternal(url);
               return { action: 'deny' };
-            });
-            win.webContents.on('will-navigate', (event, url) => {
-              if (!url.startsWith(origin)) {
-                event.preventDefault();
-                shell.openExternal(url);
-              }
             });
           }
 
@@ -363,6 +465,7 @@ jobs:
             "main": "main.js",
             "author": "MyApps Convertor",
             "description": "$APP_NAME",
+            "files": ["main.js", "config.json", "app/**/*"],
             "build": {
               "appId": "com.myapps.$SLUG",
               "productName": "$APP_NAME",
@@ -376,6 +479,47 @@ jobs:
           JSON
           node -e 'JSON.parse(require("fs").readFileSync("desktop/package.json","utf8"))'
           echo "Desktop shell ready for $APP_NAME"
+
+      - name: Unpack the uploaded codebase
+        if: github.event.client_payload.build_type == 'zip'
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
+          if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
+          unpack_codebase() {
+            local dest="$1"
+            local dl="/tmp/myapps-codebase.zip"
+            local work="/tmp/myapps-codebase"
+            command -v curl >/dev/null 2>&1 || { echo "::error::curl is not available."; exit 1; }
+            rm -rf "$work" && mkdir -p "$work"
+            curl -sSL --fail "$ZIP_URL" -o "$dl"
+            if [ "${RUNNER_OS:-Linux}" = "Windows" ]; then
+              local dl_win work_win
+              dl_win=$(cygpath -w "$dl")
+              work_win=$(cygpath -w "$work")
+              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$dl_win' -DestinationPath '$work_win' -Force"
+            else
+              unzip -q "$dl" -d "$work"
+            fi
+            local root="$work"
+            local nested=""
+            if [ ! -f "$root/index.html" ]; then
+              nested=$(find "$work" -maxdepth 3 -name index.html -print -quit)
+              if [ -n "$nested" ]; then root=$(dirname "$nested"); fi
+            fi
+            if [ ! -f "$root/index.html" ]; then
+              echo "::error::The archive does not contain an index.html. Zip the built site with index.html at its root."
+              exit 1
+            fi
+            rm -rf "$dest" && mkdir -p "$dest"
+            cp -R "$root/." "$dest/"
+            echo "Bundled the uploaded codebase from $ZIP_URL"
+          }
+          unpack_codebase "desktop/app"
+          echo "The installers ship the app files, so they run without a connection."
 
       - name: Package the installer
         shell: bash
