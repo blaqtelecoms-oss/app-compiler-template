@@ -393,7 +393,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${RUNNER_OS}" = "Linux" ]; then
-            xvfb-run -a npx electron . --verify-local-bundle
+            # This flag is confined to the disposable hosted runner probe.
+            # Installed apps retain Chromium's sandbox and normal web security.
+            xvfb-run -a npx electron . --no-sandbox --verify-local-bundle
           else
             npx electron . --verify-local-bundle
           fi
@@ -845,7 +847,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${RUNNER_OS}" = "Linux" ]; then
-            xvfb-run -a npx electron . --verify-local-bundle
+            # This flag is confined to the disposable hosted runner probe.
+            # Installed apps retain Chromium's sandbox and normal web security.
+            xvfb-run -a npx electron . --no-sandbox --verify-local-bundle
           else
             npx electron . --verify-local-bundle
           fi
@@ -1297,7 +1301,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${RUNNER_OS}" = "Linux" ]; then
-            xvfb-run -a npx electron . --verify-local-bundle
+            # This flag is confined to the disposable hosted runner probe.
+            # Installed apps retain Chromium's sandbox and normal web security.
+            xvfb-run -a npx electron . --no-sandbox --verify-local-bundle
           else
             npx electron . --verify-local-bundle
           fi
