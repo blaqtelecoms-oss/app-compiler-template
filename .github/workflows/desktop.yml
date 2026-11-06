@@ -111,37 +111,121 @@ jobs:
           set -euo pipefail
           ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
           if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
-          unpack_codebase() {
-            local dest="$1"
-            local dl="/tmp/myapps-codebase.zip"
-            local work="/tmp/myapps-codebase"
-            command -v curl >/dev/null 2>&1 || { echo "::error::curl is not available."; exit 1; }
-            rm -rf "$work" && mkdir -p "$work"
+          prepare_codebase() {
+            dest="$1"
+            dl="/tmp/myapps-codebase.zip"
+            work="/tmp/myapps-codebase"
+            rm -rf "$work" "$dest"
+            mkdir -p "$work"
+            echo "Downloading the uploaded archive"
             curl -sSL --fail "$ZIP_URL" -o "$dl"
             if [ "${RUNNER_OS:-Linux}" = "Windows" ]; then
-              local dl_win work_win
-              dl_win=$(cygpath -w "$dl")
-              work_win=$(cygpath -w "$work")
-              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$dl_win' -DestinationPath '$work_win' -Force"
+              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$dl")' -DestinationPath '$(cygpath -w "$work")' -Force"
             else
               unzip -q "$dl" -d "$work"
             fi
-            local root="$work"
-            local nested=""
-            if [ ! -f "$root/index.html" ]; then
-              nested=$(find "$work" -maxdepth 3 -name index.html -print -quit)
-              if [ -n "$nested" ]; then root=$(dirname "$nested"); fi
+
+            # The shallowest index.html is the website's entry point.
+            find_entry() {
+              depth=1
+              while [ "$depth" -le 5 ]; do
+                hit=$(find "$1" -mindepth "$depth" -maxdepth "$depth" -name index.html \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit)
+                if [ -n "$hit" ]; then dirname "$hit"; return 0; fi
+                depth=$((depth + 1))
+              done
+              return 1
+            }
+
+            # A project with a build script is a source tree - it has to be compiled.
+            find_project() {
+              if [ -f "$1/package.json" ]; then
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$1/package.json" >/dev/null 2>&1; then
+                  printf '%s' "$1"; return 0
+                fi
+              fi
+              find "$1" -mindepth 2 -maxdepth 3 -name package.json \
+                -not -path '*/node_modules/*' -not -path '*/.git/*' -print > /tmp/myapps-manifests.txt 2>/dev/null || true
+              while read -r manifest; do
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$manifest" >/dev/null 2>&1; then
+                  dirname "$manifest"; return 0
+                fi
+              done < /tmp/myapps-manifests.txt
+              return 1
+            }
+
+            # Where a compiled project puts the files that run in a browser.
+            find_output() {
+              if [ -n "$2" ]; then
+                fresh=$(find "$1" -maxdepth 4 -name index.html -newer "$2" \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
+                if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
+              fi
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
+              return 1
+            }
+
+            root=""
+            project=$(find_project "$work" || true)
+            if [ -n "$project" ]; then
+              echo "Found a source project - running its build command"
+              stamp=/tmp/myapps-build-stamp
+              touch "$stamp"
+              (
+                cd "$project"
+                if [ -f package-lock.json ]; then
+                  npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+                else
+                  npm install --no-audit --no-fund
+                fi
+                npm run build
+              )
+              root=$(find_output "$project" "$stamp" || true)
+              if [ -z "$root" ]; then
+                echo "::warning::The project built, but no site output was found - using the files as uploaded."
+              fi
             fi
-            if [ ! -f "$root/index.html" ]; then
-              echo "::error::The archive does not contain an index.html. Zip the built site with index.html at its root."
+            if [ -z "$root" ]; then root=$(find_entry "$work" || true); fi
+
+            if [ -z "$root" ] || [ ! -f "$root/index.html" ]; then
+              echo "::error::No browser-ready site was found in the archive. Upload a built site with index.html at its root, or a project whose build command produces one."
+              echo "Files found in the archive:"
+              ls -1 "$work" | head -n 15 || true
               exit 1
             fi
-            rm -rf "$dest" && mkdir -p "$dest"
+
+            mkdir -p "$dest"
             cp -R "$root/." "$dest/"
-            echo "Bundled the uploaded codebase from $ZIP_URL"
+            echo "Bundling the site from $(basename "$root")"
+            # Root-absolute paths (src="/assets/app.js") only resolve on a web
+            # server, so they become relative and load from inside the app.
+            node -e "const fs=require('fs'),f=process.argv[1];let s=fs.readFileSync(f,'utf8');s=s.replace(/((?:src|href|poster)=[\"'])\/(?!\/)/g,'\$1');fs.writeFileSync(f,s)" "$dest/index.html"
+            echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
-          unpack_codebase "desktop/app"
+          prepare_codebase "desktop/app"
           echo "The installers ship the app files, so they run without a connection."
+
+      # Installers carry the app's own artwork. electron-builder converts the
+      # square PNG into the format each operating system needs.
+      - name: Apply the app icon
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          ICON_URL=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.logo_url||""')
+          if [ -z "$ICON_URL" ]; then
+            echo "No app icon was uploaded - using the default artwork."
+            exit 0
+          fi
+          if curl -sSL --fail "$ICON_URL" -o desktop/icon.png; then
+            node -e 'const fs=require("fs");const p="desktop/package.json";const pkg=JSON.parse(fs.readFileSync(p,"utf8"));pkg.build.icon="icon.png";fs.writeFileSync(p,JSON.stringify(pkg,null,2));'
+            echo "Applied the uploaded app icon"
+          else
+            echo "::warning::The app icon could not be downloaded - using the default artwork."
+          fi
 
       - name: Package the installer
         shell: bash
@@ -159,14 +243,25 @@ jobs:
           set -euo pipefail
           TAG=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").release_tag')
           BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
-          FILE=$(ls desktop/dist/*.exe | head -n 1)
+          FILE=""
+          for candidate in desktop/dist/*.exe; do
+            [ -f "$candidate" ] || continue
+            case "$candidate" in *.blockmap) continue ;; esac
+            FILE="$candidate"
+            break
+          done
+          if [ -z "$FILE" ]; then
+            echo "::error::The installer was not produced by the packaging step."
+            ls -1 desktop/dist || true
+            exit 1
+          fi
           gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
           # GitHub rewrites characters it does not keep in an asset name (spaces
           # become dots), so the link is read back from the published release
           # instead of being guessed from the local file name.
           ASSET_JQ='[.assets[] | select(.name | ascii_downcase | endswith(".exe"))][0]'
           FILE_NAME=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.name")
-          ARTIFACT_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.url")
+          ARTIFACT_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.browser_download_url")
           if [ -z "$FILE_NAME" ] || [ -z "$ARTIFACT_URL" ]; then
             echo "::warning::The published installer could not be read back - using the local file name."
             FILE_NAME=$(basename "$FILE" | tr ' ' '.')
@@ -300,37 +395,121 @@ jobs:
           set -euo pipefail
           ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
           if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
-          unpack_codebase() {
-            local dest="$1"
-            local dl="/tmp/myapps-codebase.zip"
-            local work="/tmp/myapps-codebase"
-            command -v curl >/dev/null 2>&1 || { echo "::error::curl is not available."; exit 1; }
-            rm -rf "$work" && mkdir -p "$work"
+          prepare_codebase() {
+            dest="$1"
+            dl="/tmp/myapps-codebase.zip"
+            work="/tmp/myapps-codebase"
+            rm -rf "$work" "$dest"
+            mkdir -p "$work"
+            echo "Downloading the uploaded archive"
             curl -sSL --fail "$ZIP_URL" -o "$dl"
             if [ "${RUNNER_OS:-Linux}" = "Windows" ]; then
-              local dl_win work_win
-              dl_win=$(cygpath -w "$dl")
-              work_win=$(cygpath -w "$work")
-              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$dl_win' -DestinationPath '$work_win' -Force"
+              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$dl")' -DestinationPath '$(cygpath -w "$work")' -Force"
             else
               unzip -q "$dl" -d "$work"
             fi
-            local root="$work"
-            local nested=""
-            if [ ! -f "$root/index.html" ]; then
-              nested=$(find "$work" -maxdepth 3 -name index.html -print -quit)
-              if [ -n "$nested" ]; then root=$(dirname "$nested"); fi
+
+            # The shallowest index.html is the website's entry point.
+            find_entry() {
+              depth=1
+              while [ "$depth" -le 5 ]; do
+                hit=$(find "$1" -mindepth "$depth" -maxdepth "$depth" -name index.html \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit)
+                if [ -n "$hit" ]; then dirname "$hit"; return 0; fi
+                depth=$((depth + 1))
+              done
+              return 1
+            }
+
+            # A project with a build script is a source tree - it has to be compiled.
+            find_project() {
+              if [ -f "$1/package.json" ]; then
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$1/package.json" >/dev/null 2>&1; then
+                  printf '%s' "$1"; return 0
+                fi
+              fi
+              find "$1" -mindepth 2 -maxdepth 3 -name package.json \
+                -not -path '*/node_modules/*' -not -path '*/.git/*' -print > /tmp/myapps-manifests.txt 2>/dev/null || true
+              while read -r manifest; do
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$manifest" >/dev/null 2>&1; then
+                  dirname "$manifest"; return 0
+                fi
+              done < /tmp/myapps-manifests.txt
+              return 1
+            }
+
+            # Where a compiled project puts the files that run in a browser.
+            find_output() {
+              if [ -n "$2" ]; then
+                fresh=$(find "$1" -maxdepth 4 -name index.html -newer "$2" \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
+                if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
+              fi
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
+              return 1
+            }
+
+            root=""
+            project=$(find_project "$work" || true)
+            if [ -n "$project" ]; then
+              echo "Found a source project - running its build command"
+              stamp=/tmp/myapps-build-stamp
+              touch "$stamp"
+              (
+                cd "$project"
+                if [ -f package-lock.json ]; then
+                  npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+                else
+                  npm install --no-audit --no-fund
+                fi
+                npm run build
+              )
+              root=$(find_output "$project" "$stamp" || true)
+              if [ -z "$root" ]; then
+                echo "::warning::The project built, but no site output was found - using the files as uploaded."
+              fi
             fi
-            if [ ! -f "$root/index.html" ]; then
-              echo "::error::The archive does not contain an index.html. Zip the built site with index.html at its root."
+            if [ -z "$root" ]; then root=$(find_entry "$work" || true); fi
+
+            if [ -z "$root" ] || [ ! -f "$root/index.html" ]; then
+              echo "::error::No browser-ready site was found in the archive. Upload a built site with index.html at its root, or a project whose build command produces one."
+              echo "Files found in the archive:"
+              ls -1 "$work" | head -n 15 || true
               exit 1
             fi
-            rm -rf "$dest" && mkdir -p "$dest"
+
+            mkdir -p "$dest"
             cp -R "$root/." "$dest/"
-            echo "Bundled the uploaded codebase from $ZIP_URL"
+            echo "Bundling the site from $(basename "$root")"
+            # Root-absolute paths (src="/assets/app.js") only resolve on a web
+            # server, so they become relative and load from inside the app.
+            node -e "const fs=require('fs'),f=process.argv[1];let s=fs.readFileSync(f,'utf8');s=s.replace(/((?:src|href|poster)=[\"'])\/(?!\/)/g,'\$1');fs.writeFileSync(f,s)" "$dest/index.html"
+            echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
-          unpack_codebase "desktop/app"
+          prepare_codebase "desktop/app"
           echo "The installers ship the app files, so they run without a connection."
+
+      # Installers carry the app's own artwork. electron-builder converts the
+      # square PNG into the format each operating system needs.
+      - name: Apply the app icon
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          ICON_URL=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.logo_url||""')
+          if [ -z "$ICON_URL" ]; then
+            echo "No app icon was uploaded - using the default artwork."
+            exit 0
+          fi
+          if curl -sSL --fail "$ICON_URL" -o desktop/icon.png; then
+            node -e 'const fs=require("fs");const p="desktop/package.json";const pkg=JSON.parse(fs.readFileSync(p,"utf8"));pkg.build.icon="icon.png";fs.writeFileSync(p,JSON.stringify(pkg,null,2));'
+            echo "Applied the uploaded app icon"
+          else
+            echo "::warning::The app icon could not be downloaded - using the default artwork."
+          fi
 
       - name: Package the installer
         shell: bash
@@ -348,14 +527,25 @@ jobs:
           set -euo pipefail
           TAG=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").release_tag')
           BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
-          FILE=$(ls desktop/dist/*.dmg | head -n 1)
+          FILE=""
+          for candidate in desktop/dist/*.dmg; do
+            [ -f "$candidate" ] || continue
+            case "$candidate" in *.blockmap) continue ;; esac
+            FILE="$candidate"
+            break
+          done
+          if [ -z "$FILE" ]; then
+            echo "::error::The installer was not produced by the packaging step."
+            ls -1 desktop/dist || true
+            exit 1
+          fi
           gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
           # GitHub rewrites characters it does not keep in an asset name (spaces
           # become dots), so the link is read back from the published release
           # instead of being guessed from the local file name.
           ASSET_JQ='[.assets[] | select(.name | ascii_downcase | endswith(".dmg"))][0]'
           FILE_NAME=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.name")
-          ARTIFACT_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.url")
+          ARTIFACT_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.browser_download_url")
           if [ -z "$FILE_NAME" ] || [ -z "$ARTIFACT_URL" ]; then
             echo "::warning::The published installer could not be read back - using the local file name."
             FILE_NAME=$(basename "$FILE" | tr ' ' '.')
@@ -489,37 +679,121 @@ jobs:
           set -euo pipefail
           ZIP_URL=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").zip_url||""')
           if [ -z "$ZIP_URL" ]; then echo "::error::No codebase archive was provided."; exit 1; fi
-          unpack_codebase() {
-            local dest="$1"
-            local dl="/tmp/myapps-codebase.zip"
-            local work="/tmp/myapps-codebase"
-            command -v curl >/dev/null 2>&1 || { echo "::error::curl is not available."; exit 1; }
-            rm -rf "$work" && mkdir -p "$work"
+          prepare_codebase() {
+            dest="$1"
+            dl="/tmp/myapps-codebase.zip"
+            work="/tmp/myapps-codebase"
+            rm -rf "$work" "$dest"
+            mkdir -p "$work"
+            echo "Downloading the uploaded archive"
             curl -sSL --fail "$ZIP_URL" -o "$dl"
             if [ "${RUNNER_OS:-Linux}" = "Windows" ]; then
-              local dl_win work_win
-              dl_win=$(cygpath -w "$dl")
-              work_win=$(cygpath -w "$work")
-              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$dl_win' -DestinationPath '$work_win' -Force"
+              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$dl")' -DestinationPath '$(cygpath -w "$work")' -Force"
             else
               unzip -q "$dl" -d "$work"
             fi
-            local root="$work"
-            local nested=""
-            if [ ! -f "$root/index.html" ]; then
-              nested=$(find "$work" -maxdepth 3 -name index.html -print -quit)
-              if [ -n "$nested" ]; then root=$(dirname "$nested"); fi
+
+            # The shallowest index.html is the website's entry point.
+            find_entry() {
+              depth=1
+              while [ "$depth" -le 5 ]; do
+                hit=$(find "$1" -mindepth "$depth" -maxdepth "$depth" -name index.html \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit)
+                if [ -n "$hit" ]; then dirname "$hit"; return 0; fi
+                depth=$((depth + 1))
+              done
+              return 1
+            }
+
+            # A project with a build script is a source tree - it has to be compiled.
+            find_project() {
+              if [ -f "$1/package.json" ]; then
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$1/package.json" >/dev/null 2>&1; then
+                  printf '%s' "$1"; return 0
+                fi
+              fi
+              find "$1" -mindepth 2 -maxdepth 3 -name package.json \
+                -not -path '*/node_modules/*' -not -path '*/.git/*' -print > /tmp/myapps-manifests.txt 2>/dev/null || true
+              while read -r manifest; do
+                if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$manifest" >/dev/null 2>&1; then
+                  dirname "$manifest"; return 0
+                fi
+              done < /tmp/myapps-manifests.txt
+              return 1
+            }
+
+            # Where a compiled project puts the files that run in a browser.
+            find_output() {
+              if [ -n "$2" ]; then
+                fresh=$(find "$1" -maxdepth 4 -name index.html -newer "$2" \
+                  -not -path '*/node_modules/*' -not -path '*/.git/*' -print -quit 2>/dev/null || true)
+                if [ -n "$fresh" ]; then dirname "$fresh"; return 0; fi
+              fi
+              for candidate in dist out build .next/out .output/public site _site public www; do
+                if [ -f "$1/$candidate/index.html" ]; then printf '%s' "$1/$candidate"; return 0; fi
+              done
+              return 1
+            }
+
+            root=""
+            project=$(find_project "$work" || true)
+            if [ -n "$project" ]; then
+              echo "Found a source project - running its build command"
+              stamp=/tmp/myapps-build-stamp
+              touch "$stamp"
+              (
+                cd "$project"
+                if [ -f package-lock.json ]; then
+                  npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+                else
+                  npm install --no-audit --no-fund
+                fi
+                npm run build
+              )
+              root=$(find_output "$project" "$stamp" || true)
+              if [ -z "$root" ]; then
+                echo "::warning::The project built, but no site output was found - using the files as uploaded."
+              fi
             fi
-            if [ ! -f "$root/index.html" ]; then
-              echo "::error::The archive does not contain an index.html. Zip the built site with index.html at its root."
+            if [ -z "$root" ]; then root=$(find_entry "$work" || true); fi
+
+            if [ -z "$root" ] || [ ! -f "$root/index.html" ]; then
+              echo "::error::No browser-ready site was found in the archive. Upload a built site with index.html at its root, or a project whose build command produces one."
+              echo "Files found in the archive:"
+              ls -1 "$work" | head -n 15 || true
               exit 1
             fi
-            rm -rf "$dest" && mkdir -p "$dest"
+
+            mkdir -p "$dest"
             cp -R "$root/." "$dest/"
-            echo "Bundled the uploaded codebase from $ZIP_URL"
+            echo "Bundling the site from $(basename "$root")"
+            # Root-absolute paths (src="/assets/app.js") only resolve on a web
+            # server, so they become relative and load from inside the app.
+            node -e "const fs=require('fs'),f=process.argv[1];let s=fs.readFileSync(f,'utf8');s=s.replace(/((?:src|href|poster)=[\"'])\/(?!\/)/g,'\$1');fs.writeFileSync(f,s)" "$dest/index.html"
+            echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
-          unpack_codebase "desktop/app"
+          prepare_codebase "desktop/app"
           echo "The installers ship the app files, so they run without a connection."
+
+      # Installers carry the app's own artwork. electron-builder converts the
+      # square PNG into the format each operating system needs.
+      - name: Apply the app icon
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          ICON_URL=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.logo_url||""')
+          if [ -z "$ICON_URL" ]; then
+            echo "No app icon was uploaded - using the default artwork."
+            exit 0
+          fi
+          if curl -sSL --fail "$ICON_URL" -o desktop/icon.png; then
+            node -e 'const fs=require("fs");const p="desktop/package.json";const pkg=JSON.parse(fs.readFileSync(p,"utf8"));pkg.build.icon="icon.png";fs.writeFileSync(p,JSON.stringify(pkg,null,2));'
+            echo "Applied the uploaded app icon"
+          else
+            echo "::warning::The app icon could not be downloaded - using the default artwork."
+          fi
 
       - name: Package the installer
         shell: bash
@@ -537,14 +811,25 @@ jobs:
           set -euo pipefail
           TAG=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").release_tag')
           BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
-          FILE=$(ls desktop/dist/*.AppImage | head -n 1)
+          FILE=""
+          for candidate in desktop/dist/*.AppImage; do
+            [ -f "$candidate" ] || continue
+            case "$candidate" in *.blockmap) continue ;; esac
+            FILE="$candidate"
+            break
+          done
+          if [ -z "$FILE" ]; then
+            echo "::error::The installer was not produced by the packaging step."
+            ls -1 desktop/dist || true
+            exit 1
+          fi
           gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
           # GitHub rewrites characters it does not keep in an asset name (spaces
           # become dots), so the link is read back from the published release
           # instead of being guessed from the local file name.
           ASSET_JQ='[.assets[] | select(.name | ascii_downcase | endswith(".AppImage"))][0]'
           FILE_NAME=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.name")
-          ARTIFACT_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.url")
+          ARTIFACT_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.browser_download_url")
           if [ -z "$FILE_NAME" ] || [ -z "$ARTIFACT_URL" ]; then
             echo "::warning::The published installer could not be read back - using the local file name."
             FILE_NAME=$(basename "$FILE" | tr ' ' '.')
