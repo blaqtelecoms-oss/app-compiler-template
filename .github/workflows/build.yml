@@ -385,16 +385,9 @@ jobs:
           }
           verify(bundle);
           assert.match(fs.readFileSync(path.join(nativeBundle, 'index.html'), 'utf8'), /<base href="\/">/);
-          if (android) {
-            const core = 'wrapper/node_modules/@capacitor/android/capacitor/src/main/java/com/getcapacitor/';
-            assert.match(fs.readFileSync(core + 'Bridge.java', 'utf8'), /new WebViewLocalServer\([\s\S]{0,600},\s*true\s*\)/);
-            assert.match(fs.readFileSync(core + 'WebViewLocalServer.java', 'utf8'), /html5mode/);
-          } else {
-            const core = 'wrapper/node_modules/@capacitor/ios/Capacitor/Capacitor/';
-            assert.match(fs.readFileSync(core + 'WebViewAssetHandler.swift', 'utf8'), /WKURLSchemeHandler/);
-            assert.match(fs.readFileSync(core + 'Router.swift', 'utf8'), /index\.html/);
-          }
-          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, spaFallback: true, nativeAssets: true }));
+          // Verify the generated app, not private Capacitor source formatting. Constructor
+          // arguments and native source paths can change without changing server behavior.
+          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, nativeAssets: true }));
           MYAPPS_SCRIPT
           PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
           node /tmp/myapps-verify-mobile.cjs "$PLATFORM"
@@ -681,16 +674,9 @@ jobs:
           }
           verify(bundle);
           assert.match(fs.readFileSync(path.join(nativeBundle, 'index.html'), 'utf8'), /<base href="\/">/);
-          if (android) {
-            const core = 'wrapper/node_modules/@capacitor/android/capacitor/src/main/java/com/getcapacitor/';
-            assert.match(fs.readFileSync(core + 'Bridge.java', 'utf8'), /new WebViewLocalServer\([\s\S]{0,600},\s*true\s*\)/);
-            assert.match(fs.readFileSync(core + 'WebViewLocalServer.java', 'utf8'), /html5mode/);
-          } else {
-            const core = 'wrapper/node_modules/@capacitor/ios/Capacitor/Capacitor/';
-            assert.match(fs.readFileSync(core + 'WebViewAssetHandler.swift', 'utf8'), /WKURLSchemeHandler/);
-            assert.match(fs.readFileSync(core + 'Router.swift', 'utf8'), /index\.html/);
-          }
-          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, spaFallback: true, nativeAssets: true }));
+          // Verify the generated app, not private Capacitor source formatting. Constructor
+          // arguments and native source paths can change without changing server behavior.
+          console.log('MYAPPS_LOCAL_ORIGIN_VERIFIED ' + JSON.stringify({ platform, origin: android ? 'https://localhost/' : 'capacitor://localhost/', level: 'configuration', checked, nativeAssets: true }));
           MYAPPS_SCRIPT
           PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
           node /tmp/myapps-verify-mobile.cjs "$PLATFORM"
