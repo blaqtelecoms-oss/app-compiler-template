@@ -112,11 +112,21 @@ jobs:
           TAG=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").release_tag')
           BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
           FILE=$(ls desktop/dist/*.exe | head -n 1)
-          NAME=$(basename "$FILE")
           gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
-          echo "FILE_NAME=$NAME" >> "$GITHUB_ENV"
-          echo "ARTIFACT_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/$NAME" >> "$GITHUB_ENV"
-          echo "Published $NAME"
+          # GitHub rewrites characters it does not keep in an asset name (spaces
+          # become dots), so the link is read back from the published release
+          # instead of being guessed from the local file name.
+          ASSET_JQ='[.assets[] | select(.name | ascii_downcase | endswith(".exe"))][0]'
+          FILE_NAME=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.name")
+          ARTIFACT_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.url")
+          if [ -z "$FILE_NAME" ] || [ -z "$ARTIFACT_URL" ]; then
+            echo "::warning::The published installer could not be read back - using the local file name."
+            FILE_NAME=$(basename "$FILE" | tr ' ' '.')
+            ARTIFACT_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/$FILE_NAME"
+          fi
+          echo "FILE_NAME=$FILE_NAME" >> "$GITHUB_ENV"
+          echo "ARTIFACT_URL=$ARTIFACT_URL" >> "$GITHUB_ENV"
+          echo "Published $FILE_NAME"
 
       - name: Tell MyApps the build succeeded
         if: success()
@@ -243,11 +253,21 @@ jobs:
           TAG=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").release_tag')
           BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
           FILE=$(ls desktop/dist/*.dmg | head -n 1)
-          NAME=$(basename "$FILE")
           gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
-          echo "FILE_NAME=$NAME" >> "$GITHUB_ENV"
-          echo "ARTIFACT_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/$NAME" >> "$GITHUB_ENV"
-          echo "Published $NAME"
+          # GitHub rewrites characters it does not keep in an asset name (spaces
+          # become dots), so the link is read back from the published release
+          # instead of being guessed from the local file name.
+          ASSET_JQ='[.assets[] | select(.name | ascii_downcase | endswith(".dmg"))][0]'
+          FILE_NAME=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.name")
+          ARTIFACT_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.url")
+          if [ -z "$FILE_NAME" ] || [ -z "$ARTIFACT_URL" ]; then
+            echo "::warning::The published installer could not be read back - using the local file name."
+            FILE_NAME=$(basename "$FILE" | tr ' ' '.')
+            ARTIFACT_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/$FILE_NAME"
+          fi
+          echo "FILE_NAME=$FILE_NAME" >> "$GITHUB_ENV"
+          echo "ARTIFACT_URL=$ARTIFACT_URL" >> "$GITHUB_ENV"
+          echo "Published $FILE_NAME"
 
       - name: Tell MyApps the build succeeded
         if: success()
@@ -374,11 +394,21 @@ jobs:
           TAG=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").release_tag')
           BUILD_ID=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").build_id')
           FILE=$(ls desktop/dist/*.AppImage | head -n 1)
-          NAME=$(basename "$FILE")
           gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
-          echo "FILE_NAME=$NAME" >> "$GITHUB_ENV"
-          echo "ARTIFACT_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/$NAME" >> "$GITHUB_ENV"
-          echo "Published $NAME"
+          # GitHub rewrites characters it does not keep in an asset name (spaces
+          # become dots), so the link is read back from the published release
+          # instead of being guessed from the local file name.
+          ASSET_JQ='[.assets[] | select(.name | ascii_downcase | endswith(".AppImage"))][0]'
+          FILE_NAME=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.name")
+          ARTIFACT_URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq "$ASSET_JQ.url")
+          if [ -z "$FILE_NAME" ] || [ -z "$ARTIFACT_URL" ]; then
+            echo "::warning::The published installer could not be read back - using the local file name."
+            FILE_NAME=$(basename "$FILE" | tr ' ' '.')
+            ARTIFACT_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/$FILE_NAME"
+          fi
+          echo "FILE_NAME=$FILE_NAME" >> "$GITHUB_ENV"
+          echo "ARTIFACT_URL=$ARTIFACT_URL" >> "$GITHUB_ENV"
+          echo "Published $FILE_NAME"
 
       - name: Tell MyApps the build succeeded
         if: success()
