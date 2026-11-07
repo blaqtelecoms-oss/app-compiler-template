@@ -1203,16 +1203,16 @@ jobs:
             appId: appId,
             appName: c.app_name || p.app_name || 'My App',
             webDir: 'www',
-            backgroundColor: '#FFFFFF',
+            backgroundColor: "#FFFFFF",
             server: offline
               ? { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false }
               : { url: p.website_url, cleartext: false },
-            ios: { backgroundColor: '#FFFFFF' },
+            ios: { backgroundColor: "#FFFFFF"},
             plugins: {
               SplashScreen: {
                 launchShowDuration: 1200,
                 launchAutoHide: true,
-                backgroundColor: '#FFFFFF',
+                backgroundColor: "#FFFFFF",
                 showSpinner: false
               }
             }
