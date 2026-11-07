@@ -1157,34 +1157,137 @@ jobs:
 
   ios:
     if: github.event.client_payload.platform == 'ios'
+    # Apple needs a real certificate, so the runner imports the signing secrets
+    # before compiling. The ZIP bundle step is injected above the compile step.
     runs-on: macos-latest
     steps:
-      - name: Set up Node.js
+      - name: Checkout template
+        uses: actions/checkout@v4
 
+      - name: Setup Node.js
         uses: actions/setup-node@v4
-
         with:
-
           node-version: '20'
 
       - name: Prepare the iOS wrapper
-        if: github.event.client_payload.build_type == 'zip'
-        shell: bash
         env:
           PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           set -euo pipefail
-          mkdir -p wrapper/www
           cat > /tmp/myapps-prepare-ios.cjs <<'MYAPPS_SCRIPT'
           const fs = require('fs');
           const p = JSON.parse(process.env.PAYLOAD || '{}');
           const c = p.app_config || {};
-          fs.writeFileSync('wrapper/www/index.html', '<!doctype html><html><head><title>Loading</title></head><body>Loading</body></html>');
-          fs.writeFileSync('wrapper/package.json', JSON.stringify({ name: 'myapps-ios-wrapper', private: true, devDependencies: { '@capacitor/cli': '^7.0.0' }, dependencies: { '@capacitor/core': '^7.0.0', '@capacitor/ios': '^7.0.0', '@capacitor/splash-screen': '^7.0.0' } }));
-          fs.writeFileSync('wrapper/capacitor.config.json', JSON.stringify({ appId: p.package_name || c.package_name || 'com.myapps.app', appName: p.app_name || 'My App', webDir: 'www', server: { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false } }));
+          const slug = String(p.app_name || 'myapp').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'app';
+          const offline = ['zip', 'folder', 'github'].includes(String(p.build_type || ''));
+          const appId = c.package_name || p.package_name || 'com.myapps.' + slug;
+          
+          fs.mkdirSync('wrapper/www', { recursive: true });
+          const entry = 'wrapper/www/index.html';
+          if (!fs.existsSync(entry)) {
+            fs.writeFileSync(entry, '<!doctype html><html><head><meta charset="utf-8"><title>Loading</title></head><body style="margin:0;background:#ffffff;color:#111827;display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui,sans-serif"><p>Loading&hellip;</p></body></html>');
+          }
+          
+          fs.writeFileSync('wrapper/package.json', JSON.stringify({
+            name: 'myapps-ios-wrapper',
+            private: true,
+            devDependencies: { '@capacitor/cli': '^7.0.0' },
+            dependencies: {
+              '@capacitor/core': '^7.0.0',
+              '@capacitor/ios': '^7.0.0',
+              '@capacitor/splash-screen': '^7.0.0'
+            }
+          }, null, 2));
+          
+          fs.writeFileSync('wrapper/capacitor.config.json', JSON.stringify({
+            appId: appId,
+            appName: c.app_name || p.app_name || 'My App',
+            webDir: 'www',
+            backgroundColor: '#FFFFFF',
+            server: offline
+              ? { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false }
+              : { url: p.website_url, cleartext: false },
+            ios: { backgroundColor: '#FFFFFF' },
+            plugins: {
+              SplashScreen: {
+                launchShowDuration: 1200,
+                launchAutoHide: true,
+                backgroundColor: '#FFFFFF',
+                showSpinner: false
+              }
+            }
+          }, null, 2));
+          
+          console.log('MYAPPS_IOS_WRAPPER_PREPARED ' + appId);
           MYAPPS_SCRIPT
           node /tmp/myapps-prepare-ios.cjs
-          (cd wrapper && npm install --no-audit --no-fund && npx cap add ios && npx cap sync ios)
+          cd wrapper && npm install --no-audit --no-fund && npx cap add ios && npx cap sync ios
+
+      - name: Work out the iOS bundle id and version
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          IOS_EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/myapps-ios-target.cjs <<'MYAPPS_SCRIPT'
+          const p = JSON.parse(process.env.PAYLOAD || '{}');
+          const c = p.app_config || {};
+          const slug = String(p.app_name || 'myapp').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'app';
+          const lines = [
+            'BUNDLE_ID=' + (c.package_name || p.package_name || 'com.myapps.' + slug),
+            'IOS_VERSION_NAME=' + String(c.version_name || '1.0.0'),
+            'IOS_BUILD_NUMBER=' + String(c.version_code || 1),
+            'IOS_EXPORT_METHOD=' + (process.env.IOS_EXPORT_METHOD || 'development')
+          ];
+          console.log(lines.join('\n'));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-ios-target.cjs > "$RUNNER_TEMP/ios-target.env"
+          . "$RUNNER_TEMP/ios-target.env"
+          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+          echo "IOS_VERSION_NAME=$IOS_VERSION_NAME" >> "$GITHUB_ENV"
+          echo "IOS_BUILD_NUMBER=$IOS_BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "IOS_EXPORT_METHOD=$IOS_EXPORT_METHOD" >> "$GITHUB_ENV"
+
+      - name: Install the Apple signing certificate
+        env:
+          IOS_CERTIFICATE_P12: ${{ secrets.IOS_CERTIFICATE_P12 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$IOS_CERTIFICATE_P12" ] || [ -z "$IOS_CERTIFICATE_PASSWORD" ]; then
+            echo "IOS_SIGNING_ERROR=iOS signing is not set up: add IOS_CERTIFICATE_P12 and IOS_CERTIFICATE_PASSWORD to the repo Actions secrets, then build again." >> "$GITHUB_ENV"
+            echo "::error::Add IOS_CERTIFICATE_P12 and IOS_CERTIFICATE_PASSWORD to this repository."
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/myapps-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$IOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          echo "MYAPPS_IOS_CERTIFICATE_READY"
+
+      - name: Install the provisioning profile
+        env:
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          if [ -z "$IOS_PROVISIONING_PROFILE" ]; then
+            echo "IOS_SIGNING_ERROR=iOS signing is not set up: add IOS_PROVISIONING_PROFILE to the repo Actions secrets, then build again." >> "$GITHUB_ENV"
+            echo "::error::Add IOS_PROVISIONING_PROFILE to this repository."
+            exit 1
+          fi
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$IOS_PROVISIONING_PROFILE" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print Name" "$RUNNER_TEMP/profile.plist")
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" "$RUNNER_TEMP/profile.plist")
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          echo "MYAPPS_IOS_PROFILE=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "Installed provisioning profile $PROFILE_NAME"
 
       - name: Bundle the uploaded codebase for offline use
         if: github.event.client_payload.build_type == 'zip'
@@ -1807,7 +1910,63 @@ jobs:
           PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
           node /tmp/myapps-verify-mobile.cjs "$PLATFORM"
 
-      - name: Report that iOS signing is not configured
+      - name: Compile and sign the iOS app
+        env:
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$IOS_TEAM_ID" ]; then
+            echo "IOS_SIGNING_ERROR=iOS signing is not set up: add IOS_TEAM_ID to the repo Actions secrets, then build again." >> "$GITHUB_ENV"
+            echo "::error::Add IOS_TEAM_ID to this repository."
+            exit 1
+          fi
+          PLIST=wrapper/ios/App/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $IOS_VERSION_NAME" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $IOS_VERSION_NAME" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $IOS_BUILD_NUMBER" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $IOS_BUILD_NUMBER" "$PLIST"
+          cat > "$RUNNER_TEMP/export.plist" <<PLIST_FILE
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>$IOS_EXPORT_METHOD</string>
+            <key>teamID</key>
+            <string>$IOS_TEAM_ID</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$BUNDLE_ID</key>
+              <string>$MYAPPS_IOS_PROFILE</string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST_FILE
+          xcodebuild -workspace wrapper/ios/App/App.xcworkspace -scheme App -configuration Release \
+            -destination "generic/platform=iOS" -archivePath "$RUNNER_TEMP/MyApp.xcarchive" \
+            DEVELOPMENT_TEAM="$IOS_TEAM_ID" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGN_STYLE=Manual PROVISIONING_PROFILE_SPECIFIER="$MYAPPS_IOS_PROFILE" \
+            MARKETING_VERSION="$IOS_VERSION_NAME" CURRENT_PROJECT_VERSION="$IOS_BUILD_NUMBER" \
+            archive
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/MyApp.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/export.plist" -exportPath "$RUNNER_TEMP/ipa"
+          echo "Signed $BUNDLE_ID $IOS_VERSION_NAME ($IOS_BUILD_NUMBER) as $IOS_EXPORT_METHOD"
+
+      - name: Publish the IPA as a public release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+        run: |
+          set -euo pipefail
+          IPA=$(find "$RUNNER_TEMP/ipa" -maxdepth 1 -name "*.ipa" | head -1)
+          cp "$IPA" app.ipa
+          gh release create "build-$BUILD_ID" app.ipa --title "Build $BUILD_ID" --notes "Signed by MyApps Convertor" >/dev/null || gh release upload "build-$BUILD_ID" app.ipa --clobber
+          echo "IPA_URL=https://github.com/${{ github.repository }}/releases/download/build-$BUILD_ID/app.ipa" >> "$GITHUB_ENV"
+
+      - name: Tell MyApps the build succeeded
+        if: success()
         env:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
@@ -1816,4 +1975,22 @@ jobs:
           curl -sS -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
             -H "x-webhook-secret: $WEBHOOK_SECRET" \
-            -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"message\":\"iOS builds need an Apple Developer certificate and a macOS runner. Add signing to the template repo, then build again.\"}"
+            -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"status\":\"success\",\"artifact_url\":\"$IPA_URL\"}"
+
+      - name: Tell MyApps the build failed
+        if: failure()
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+        run: |
+          if [ -n "$IOS_SIGNING_ERROR" ]; then
+            export FAILURE_MESSAGE="$IOS_SIGNING_ERROR"
+          else
+            export FAILURE_MESSAGE="The iOS build failed - open the Actions log for this run."
+          fi
+          BODY=$(node -e "console.log(JSON.stringify({secret:process.env.WEBHOOK_SECRET,build_id:process.env.BUILD_ID,status:'failed',message:process.env.FAILURE_MESSAGE}))")
+          curl -sS -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: $WEBHOOK_SECRET" \
+            -d "$BODY"
