@@ -143,7 +143,7 @@ jobs:
             if (verifying) return;
             if (!fs.existsSync(path.join(__dirname, 'splash.png'))) return;
             splash = new BrowserWindow({
-              width: 400, height: 660, frame: false, resizable: false, backgroundColor: '#ffffff',
+              width: 600, height: 400, frame: false, resizable: false, backgroundColor: '#ffffff',
               webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
             });
             splash.loadFile(path.join(__dirname, 'splash.html'));
@@ -366,8 +366,15 @@ jobs:
               echo "Found a source project - running its build command"
               stamp=/tmp/myapps-build-stamp
               touch "$stamp"
+              # A source project can read the original site address while it compiles.
+              SITE_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}");const c=p.app_config||{};String(c.site_url||p.website_url||"")' || true)
               (
                 cd "$project"
+                if [ -n "${SITE_URL:-}" ]; then
+                  export VITE_APP_URL="$SITE_URL"
+                  export REACT_APP_API_URL="$SITE_URL"
+                  export NEXT_PUBLIC_APP_URL="$SITE_URL"
+                fi
                 if [ -f package-lock.json ]; then
                   npm ci --no-audit --no-fund || npm install --no-audit --no-fund
                 else
@@ -397,6 +404,48 @@ jobs:
             echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
           prepare_codebase "desktop/app"
+          cat > /tmp/myapps-runtime-config.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          const payload = JSON.parse(process.env.PAYLOAD || '{}');
+          const config = payload.app_config || {};
+          const raw = String(config.site_url || payload.website_url || '').trim();
+          const siteUrl = /^https:\/\/[a-z0-9.-]+\.[a-z]{2,}(?::\d{2,5})?(\/\S*)?$/i.test(raw) ? raw.replace(/\/+$/, '') : '';
+
+          if (!fs.existsSync(root)) {
+            console.error('::error::The app files are missing, so the runtime configuration could not be written.');
+            process.exit(1);
+          }
+
+          const runtime = {
+            appName: String(config.app_name || payload.app_name || ''),
+            platform: String(config.platform || payload.platform || ''),
+            siteUrl: siteUrl,
+            apiBase: siteUrl,
+            offlineBundle: true,
+          };
+          fs.writeFileSync(path.join(root, 'myapps-runtime-config.json'), JSON.stringify(runtime, null, 2));
+
+          const entry = path.join(root, 'index.html');
+          if (!fs.existsSync(entry)) {
+            console.error('::error::The app files have no index.html to carry the runtime configuration.');
+            process.exit(1);
+          }
+
+          let html = fs.readFileSync(entry, 'utf8');
+          if (html.indexOf('__MYAPPS_CONFIG__') === -1) {
+            const bag = JSON.stringify(runtime).replace(/</g, '\u003c');
+            const tag = '<script>window.__MYAPPS_CONFIG__=' + bag +
+              ';window.__MYAPPS_SITE_URL__=' + JSON.stringify(siteUrl) +
+              ';window.MyApps=window.MyApps||{};window.MyApps.config=window.__MYAPPS_CONFIG__;</script>';
+            html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, () => tag + '</body>') : html + tag;
+            fs.writeFileSync(entry, html);
+          }
+
+          console.log('MYAPPS_RUNTIME_CONFIG ' + JSON.stringify({ siteUrl: siteUrl, apiBase: siteUrl, configFile: 'myapps-runtime-config.json' }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-runtime-config.cjs desktop/app
           echo "The installers ship the app files, so they run without a connection."
 
       # Installers carry the app's own artwork. electron-builder converts the
@@ -654,7 +703,7 @@ jobs:
             if (verifying) return;
             if (!fs.existsSync(path.join(__dirname, 'splash.png'))) return;
             splash = new BrowserWindow({
-              width: 400, height: 660, frame: false, resizable: false, backgroundColor: '#ffffff',
+              width: 600, height: 400, frame: false, resizable: false, backgroundColor: '#ffffff',
               webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
             });
             splash.loadFile(path.join(__dirname, 'splash.html'));
@@ -877,8 +926,15 @@ jobs:
               echo "Found a source project - running its build command"
               stamp=/tmp/myapps-build-stamp
               touch "$stamp"
+              # A source project can read the original site address while it compiles.
+              SITE_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}");const c=p.app_config||{};String(c.site_url||p.website_url||"")' || true)
               (
                 cd "$project"
+                if [ -n "${SITE_URL:-}" ]; then
+                  export VITE_APP_URL="$SITE_URL"
+                  export REACT_APP_API_URL="$SITE_URL"
+                  export NEXT_PUBLIC_APP_URL="$SITE_URL"
+                fi
                 if [ -f package-lock.json ]; then
                   npm ci --no-audit --no-fund || npm install --no-audit --no-fund
                 else
@@ -908,6 +964,48 @@ jobs:
             echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
           prepare_codebase "desktop/app"
+          cat > /tmp/myapps-runtime-config.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          const payload = JSON.parse(process.env.PAYLOAD || '{}');
+          const config = payload.app_config || {};
+          const raw = String(config.site_url || payload.website_url || '').trim();
+          const siteUrl = /^https:\/\/[a-z0-9.-]+\.[a-z]{2,}(?::\d{2,5})?(\/\S*)?$/i.test(raw) ? raw.replace(/\/+$/, '') : '';
+
+          if (!fs.existsSync(root)) {
+            console.error('::error::The app files are missing, so the runtime configuration could not be written.');
+            process.exit(1);
+          }
+
+          const runtime = {
+            appName: String(config.app_name || payload.app_name || ''),
+            platform: String(config.platform || payload.platform || ''),
+            siteUrl: siteUrl,
+            apiBase: siteUrl,
+            offlineBundle: true,
+          };
+          fs.writeFileSync(path.join(root, 'myapps-runtime-config.json'), JSON.stringify(runtime, null, 2));
+
+          const entry = path.join(root, 'index.html');
+          if (!fs.existsSync(entry)) {
+            console.error('::error::The app files have no index.html to carry the runtime configuration.');
+            process.exit(1);
+          }
+
+          let html = fs.readFileSync(entry, 'utf8');
+          if (html.indexOf('__MYAPPS_CONFIG__') === -1) {
+            const bag = JSON.stringify(runtime).replace(/</g, '\u003c');
+            const tag = '<script>window.__MYAPPS_CONFIG__=' + bag +
+              ';window.__MYAPPS_SITE_URL__=' + JSON.stringify(siteUrl) +
+              ';window.MyApps=window.MyApps||{};window.MyApps.config=window.__MYAPPS_CONFIG__;</script>';
+            html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, () => tag + '</body>') : html + tag;
+            fs.writeFileSync(entry, html);
+          }
+
+          console.log('MYAPPS_RUNTIME_CONFIG ' + JSON.stringify({ siteUrl: siteUrl, apiBase: siteUrl, configFile: 'myapps-runtime-config.json' }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-runtime-config.cjs desktop/app
           echo "The installers ship the app files, so they run without a connection."
 
       # Installers carry the app's own artwork. electron-builder converts the
@@ -1165,7 +1263,7 @@ jobs:
             if (verifying) return;
             if (!fs.existsSync(path.join(__dirname, 'splash.png'))) return;
             splash = new BrowserWindow({
-              width: 400, height: 660, frame: false, resizable: false, backgroundColor: '#ffffff',
+              width: 600, height: 400, frame: false, resizable: false, backgroundColor: '#ffffff',
               webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
             });
             splash.loadFile(path.join(__dirname, 'splash.html'));
@@ -1388,8 +1486,15 @@ jobs:
               echo "Found a source project - running its build command"
               stamp=/tmp/myapps-build-stamp
               touch "$stamp"
+              # A source project can read the original site address while it compiles.
+              SITE_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}");const c=p.app_config||{};String(c.site_url||p.website_url||"")' || true)
               (
                 cd "$project"
+                if [ -n "${SITE_URL:-}" ]; then
+                  export VITE_APP_URL="$SITE_URL"
+                  export REACT_APP_API_URL="$SITE_URL"
+                  export NEXT_PUBLIC_APP_URL="$SITE_URL"
+                fi
                 if [ -f package-lock.json ]; then
                   npm ci --no-audit --no-fund || npm install --no-audit --no-fund
                 else
@@ -1419,6 +1524,48 @@ jobs:
             echo "Bundled $(find "$dest" -type f | wc -l) files into the app"
           }
           prepare_codebase "desktop/app"
+          cat > /tmp/myapps-runtime-config.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          const payload = JSON.parse(process.env.PAYLOAD || '{}');
+          const config = payload.app_config || {};
+          const raw = String(config.site_url || payload.website_url || '').trim();
+          const siteUrl = /^https:\/\/[a-z0-9.-]+\.[a-z]{2,}(?::\d{2,5})?(\/\S*)?$/i.test(raw) ? raw.replace(/\/+$/, '') : '';
+
+          if (!fs.existsSync(root)) {
+            console.error('::error::The app files are missing, so the runtime configuration could not be written.');
+            process.exit(1);
+          }
+
+          const runtime = {
+            appName: String(config.app_name || payload.app_name || ''),
+            platform: String(config.platform || payload.platform || ''),
+            siteUrl: siteUrl,
+            apiBase: siteUrl,
+            offlineBundle: true,
+          };
+          fs.writeFileSync(path.join(root, 'myapps-runtime-config.json'), JSON.stringify(runtime, null, 2));
+
+          const entry = path.join(root, 'index.html');
+          if (!fs.existsSync(entry)) {
+            console.error('::error::The app files have no index.html to carry the runtime configuration.');
+            process.exit(1);
+          }
+
+          let html = fs.readFileSync(entry, 'utf8');
+          if (html.indexOf('__MYAPPS_CONFIG__') === -1) {
+            const bag = JSON.stringify(runtime).replace(/</g, '\u003c');
+            const tag = '<script>window.__MYAPPS_CONFIG__=' + bag +
+              ';window.__MYAPPS_SITE_URL__=' + JSON.stringify(siteUrl) +
+              ';window.MyApps=window.MyApps||{};window.MyApps.config=window.__MYAPPS_CONFIG__;</script>';
+            html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, () => tag + '</body>') : html + tag;
+            fs.writeFileSync(entry, html);
+          }
+
+          console.log('MYAPPS_RUNTIME_CONFIG ' + JSON.stringify({ siteUrl: siteUrl, apiBase: siteUrl, configFile: 'myapps-runtime-config.json' }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-runtime-config.cjs desktop/app
           echo "The installers ship the app files, so they run without a connection."
 
       # Installers carry the app's own artwork. electron-builder converts the
