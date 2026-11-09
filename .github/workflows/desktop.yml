@@ -375,6 +375,18 @@ jobs:
                   export REACT_APP_API_URL="$SITE_URL"
                   export NEXT_PUBLIC_APP_URL="$SITE_URL"
                 fi
+                # A supplied Supabase connection reaches the project's own build too,
+                # through the environment variables Vite and Create React App read.
+                SUPABASE_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}");String(p.supabase_url||(p.app_config||{}).supabase_url||"")' || true)
+                SUPABASE_ANON_KEY=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}");String(p.supabase_anon_key||(p.app_config||{}).supabase_anon_key||"")' || true)
+                if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_ANON_KEY:-}" ]; then
+                  export VITE_SUPABASE_URL="$SUPABASE_URL" VITE_SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+                  export REACT_APP_SUPABASE_URL="$SUPABASE_URL" REACT_APP_SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+                  export NEXT_PUBLIC_SUPABASE_URL="$SUPABASE_URL" NEXT_PUBLIC_SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+                  printf 'VITE_SUPABASE_URL=%s\nVITE_SUPABASE_ANON_KEY=%s\nREACT_APP_SUPABASE_URL=%s\nREACT_APP_SUPABASE_ANON_KEY=%s\nNEXT_PUBLIC_SUPABASE_URL=%s\nNEXT_PUBLIC_SUPABASE_ANON_KEY=%s\n' \
+                    "$SUPABASE_URL" "$SUPABASE_ANON_KEY" "$SUPABASE_URL" "$SUPABASE_ANON_KEY" "$SUPABASE_URL" "$SUPABASE_ANON_KEY" >> .env.production
+                  echo "MYAPPS_SUPABASE_ENV the project build reads the supplied Supabase settings"
+                fi
                 if [ -f package-lock.json ]; then
                   npm ci --no-audit --no-fund || npm install --no-audit --no-fund
                 else
@@ -446,6 +458,65 @@ jobs:
           console.log('MYAPPS_RUNTIME_CONFIG ' + JSON.stringify({ siteUrl: siteUrl, apiBase: siteUrl, configFile: 'myapps-runtime-config.json' }));
           MYAPPS_SCRIPT
           node /tmp/myapps-runtime-config.cjs desktop/app
+          cat > /tmp/myapps-supabase-env.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          const payload = JSON.parse(process.env.PAYLOAD || '{}');
+          const config = payload.app_config || {};
+          const url = String(payload.supabase_url || config.supabase_url || '').trim().replace(/\/+$/, '');
+          const key = String(payload.supabase_anon_key || config.supabase_anon_key || '').trim();
+
+          if (!url || !key) {
+            console.log('MYAPPS_SUPABASE_SKIPPED no database settings were supplied');
+            process.exit(0);
+          }
+          if (!fs.existsSync(root)) {
+            console.error('::error::The app files are missing, so the database settings could not be written.');
+            process.exit(1);
+          }
+
+          const entries = [
+            ['VITE_SUPABASE_URL', url],
+            ['VITE_SUPABASE_ANON_KEY', key],
+            ['REACT_APP_SUPABASE_URL', url],
+            ['REACT_APP_SUPABASE_ANON_KEY', key],
+            ['NEXT_PUBLIC_SUPABASE_URL', url],
+            ['NEXT_PUBLIC_SUPABASE_ANON_KEY', key],
+          ];
+
+          function writeEnv(file) {
+            const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split(/\r?\n/) : [];
+            const kept = existing.filter((line) => {
+              const name = line.split('=')[0].trim();
+              return !entries.some((entry) => entry[0] === name);
+            });
+            while (kept.length && kept[kept.length - 1] === '') kept.pop();
+            const body = kept.concat(entries.map((entry) => entry[0] + '=' + entry[1])).join('\n') + '\n';
+            fs.writeFileSync(file, body);
+          }
+          writeEnv(path.join(root, '.env'));
+          writeEnv(path.join(root, '.env.production'));
+
+          const runtime = { supabaseUrl: url, supabaseAnonKey: key };
+          fs.writeFileSync(path.join(root, 'supabase.config.json'), JSON.stringify(runtime, null, 2));
+
+          const entry = path.join(root, 'index.html');
+          if (fs.existsSync(entry)) {
+            let html = fs.readFileSync(entry, 'utf8');
+            if (html.indexOf('__MYAPPS_SUPABASE__') === -1) {
+              const bag = JSON.stringify(runtime);
+              const tag = '<script>window.__MYAPPS_SUPABASE__=' + bag +
+                ';window.SUPABASE_URL=' + JSON.stringify(url) +
+                ';window.SUPABASE_ANON_KEY=' + JSON.stringify(key) + ';</script>';
+              html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, () => tag + '</body>') : html + tag;
+              fs.writeFileSync(entry, html);
+            }
+          }
+
+          console.log('MYAPPS_SUPABASE_ENV ' + JSON.stringify({ url: url, keyLength: key.length, files: ['.env', '.env.production', 'supabase.config.json'] }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-supabase-env.cjs desktop/app
           echo "The installers ship the app files, so they run without a connection."
 
       # Installers carry the app's own artwork. electron-builder converts the
@@ -935,6 +1006,18 @@ jobs:
                   export REACT_APP_API_URL="$SITE_URL"
                   export NEXT_PUBLIC_APP_URL="$SITE_URL"
                 fi
+                # A supplied Supabase connection reaches the project's own build too,
+                # through the environment variables Vite and Create React App read.
+                SUPABASE_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}");String(p.supabase_url||(p.app_config||{}).supabase_url||"")' || true)
+                SUPABASE_ANON_KEY=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}");String(p.supabase_anon_key||(p.app_config||{}).supabase_anon_key||"")' || true)
+                if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_ANON_KEY:-}" ]; then
+                  export VITE_SUPABASE_URL="$SUPABASE_URL" VITE_SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+                  export REACT_APP_SUPABASE_URL="$SUPABASE_URL" REACT_APP_SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+                  export NEXT_PUBLIC_SUPABASE_URL="$SUPABASE_URL" NEXT_PUBLIC_SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+                  printf 'VITE_SUPABASE_URL=%s\nVITE_SUPABASE_ANON_KEY=%s\nREACT_APP_SUPABASE_URL=%s\nREACT_APP_SUPABASE_ANON_KEY=%s\nNEXT_PUBLIC_SUPABASE_URL=%s\nNEXT_PUBLIC_SUPABASE_ANON_KEY=%s\n' \
+                    "$SUPABASE_URL" "$SUPABASE_ANON_KEY" "$SUPABASE_URL" "$SUPABASE_ANON_KEY" "$SUPABASE_URL" "$SUPABASE_ANON_KEY" >> .env.production
+                  echo "MYAPPS_SUPABASE_ENV the project build reads the supplied Supabase settings"
+                fi
                 if [ -f package-lock.json ]; then
                   npm ci --no-audit --no-fund || npm install --no-audit --no-fund
                 else
@@ -1006,6 +1089,65 @@ jobs:
           console.log('MYAPPS_RUNTIME_CONFIG ' + JSON.stringify({ siteUrl: siteUrl, apiBase: siteUrl, configFile: 'myapps-runtime-config.json' }));
           MYAPPS_SCRIPT
           node /tmp/myapps-runtime-config.cjs desktop/app
+          cat > /tmp/myapps-supabase-env.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          const payload = JSON.parse(process.env.PAYLOAD || '{}');
+          const config = payload.app_config || {};
+          const url = String(payload.supabase_url || config.supabase_url || '').trim().replace(/\/+$/, '');
+          const key = String(payload.supabase_anon_key || config.supabase_anon_key || '').trim();
+
+          if (!url || !key) {
+            console.log('MYAPPS_SUPABASE_SKIPPED no database settings were supplied');
+            process.exit(0);
+          }
+          if (!fs.existsSync(root)) {
+            console.error('::error::The app files are missing, so the database settings could not be written.');
+            process.exit(1);
+          }
+
+          const entries = [
+            ['VITE_SUPABASE_URL', url],
+            ['VITE_SUPABASE_ANON_KEY', key],
+            ['REACT_APP_SUPABASE_URL', url],
+            ['REACT_APP_SUPABASE_ANON_KEY', key],
+            ['NEXT_PUBLIC_SUPABASE_URL', url],
+            ['NEXT_PUBLIC_SUPABASE_ANON_KEY', key],
+          ];
+
+          function writeEnv(file) {
+            const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split(/\r?\n/) : [];
+            const kept = existing.filter((line) => {
+              const name = line.split('=')[0].trim();
+              return !entries.some((entry) => entry[0] === name);
+            });
+            while (kept.length && kept[kept.length - 1] === '') kept.pop();
+            const body = kept.concat(entries.map((entry) => entry[0] + '=' + entry[1])).join('\n') + '\n';
+            fs.writeFileSync(file, body);
+          }
+          writeEnv(path.join(root, '.env'));
+          writeEnv(path.join(root, '.env.production'));
+
+          const runtime = { supabaseUrl: url, supabaseAnonKey: key };
+          fs.writeFileSync(path.join(root, 'supabase.config.json'), JSON.stringify(runtime, null, 2));
+
+          const entry = path.join(root, 'index.html');
+          if (fs.existsSync(entry)) {
+            let html = fs.readFileSync(entry, 'utf8');
+            if (html.indexOf('__MYAPPS_SUPABASE__') === -1) {
+              const bag = JSON.stringify(runtime);
+              const tag = '<script>window.__MYAPPS_SUPABASE__=' + bag +
+                ';window.SUPABASE_URL=' + JSON.stringify(url) +
+                ';window.SUPABASE_ANON_KEY=' + JSON.stringify(key) + ';</script>';
+              html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, () => tag + '</body>') : html + tag;
+              fs.writeFileSync(entry, html);
+            }
+          }
+
+          console.log('MYAPPS_SUPABASE_ENV ' + JSON.stringify({ url: url, keyLength: key.length, files: ['.env', '.env.production', 'supabase.config.json'] }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-supabase-env.cjs desktop/app
           echo "The installers ship the app files, so they run without a connection."
 
       # Installers carry the app's own artwork. electron-builder converts the
@@ -1495,6 +1637,18 @@ jobs:
                   export REACT_APP_API_URL="$SITE_URL"
                   export NEXT_PUBLIC_APP_URL="$SITE_URL"
                 fi
+                # A supplied Supabase connection reaches the project's own build too,
+                # through the environment variables Vite and Create React App read.
+                SUPABASE_URL=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}");String(p.supabase_url||(p.app_config||{}).supabase_url||"")' || true)
+                SUPABASE_ANON_KEY=$(node -p 'const p=JSON.parse(process.env.PAYLOAD||"{}");String(p.supabase_anon_key||(p.app_config||{}).supabase_anon_key||"")' || true)
+                if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_ANON_KEY:-}" ]; then
+                  export VITE_SUPABASE_URL="$SUPABASE_URL" VITE_SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+                  export REACT_APP_SUPABASE_URL="$SUPABASE_URL" REACT_APP_SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+                  export NEXT_PUBLIC_SUPABASE_URL="$SUPABASE_URL" NEXT_PUBLIC_SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+                  printf 'VITE_SUPABASE_URL=%s\nVITE_SUPABASE_ANON_KEY=%s\nREACT_APP_SUPABASE_URL=%s\nREACT_APP_SUPABASE_ANON_KEY=%s\nNEXT_PUBLIC_SUPABASE_URL=%s\nNEXT_PUBLIC_SUPABASE_ANON_KEY=%s\n' \
+                    "$SUPABASE_URL" "$SUPABASE_ANON_KEY" "$SUPABASE_URL" "$SUPABASE_ANON_KEY" "$SUPABASE_URL" "$SUPABASE_ANON_KEY" >> .env.production
+                  echo "MYAPPS_SUPABASE_ENV the project build reads the supplied Supabase settings"
+                fi
                 if [ -f package-lock.json ]; then
                   npm ci --no-audit --no-fund || npm install --no-audit --no-fund
                 else
@@ -1566,6 +1720,65 @@ jobs:
           console.log('MYAPPS_RUNTIME_CONFIG ' + JSON.stringify({ siteUrl: siteUrl, apiBase: siteUrl, configFile: 'myapps-runtime-config.json' }));
           MYAPPS_SCRIPT
           node /tmp/myapps-runtime-config.cjs desktop/app
+          cat > /tmp/myapps-supabase-env.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const root = path.resolve(process.argv[2]);
+          const payload = JSON.parse(process.env.PAYLOAD || '{}');
+          const config = payload.app_config || {};
+          const url = String(payload.supabase_url || config.supabase_url || '').trim().replace(/\/+$/, '');
+          const key = String(payload.supabase_anon_key || config.supabase_anon_key || '').trim();
+
+          if (!url || !key) {
+            console.log('MYAPPS_SUPABASE_SKIPPED no database settings were supplied');
+            process.exit(0);
+          }
+          if (!fs.existsSync(root)) {
+            console.error('::error::The app files are missing, so the database settings could not be written.');
+            process.exit(1);
+          }
+
+          const entries = [
+            ['VITE_SUPABASE_URL', url],
+            ['VITE_SUPABASE_ANON_KEY', key],
+            ['REACT_APP_SUPABASE_URL', url],
+            ['REACT_APP_SUPABASE_ANON_KEY', key],
+            ['NEXT_PUBLIC_SUPABASE_URL', url],
+            ['NEXT_PUBLIC_SUPABASE_ANON_KEY', key],
+          ];
+
+          function writeEnv(file) {
+            const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split(/\r?\n/) : [];
+            const kept = existing.filter((line) => {
+              const name = line.split('=')[0].trim();
+              return !entries.some((entry) => entry[0] === name);
+            });
+            while (kept.length && kept[kept.length - 1] === '') kept.pop();
+            const body = kept.concat(entries.map((entry) => entry[0] + '=' + entry[1])).join('\n') + '\n';
+            fs.writeFileSync(file, body);
+          }
+          writeEnv(path.join(root, '.env'));
+          writeEnv(path.join(root, '.env.production'));
+
+          const runtime = { supabaseUrl: url, supabaseAnonKey: key };
+          fs.writeFileSync(path.join(root, 'supabase.config.json'), JSON.stringify(runtime, null, 2));
+
+          const entry = path.join(root, 'index.html');
+          if (fs.existsSync(entry)) {
+            let html = fs.readFileSync(entry, 'utf8');
+            if (html.indexOf('__MYAPPS_SUPABASE__') === -1) {
+              const bag = JSON.stringify(runtime);
+              const tag = '<script>window.__MYAPPS_SUPABASE__=' + bag +
+                ';window.SUPABASE_URL=' + JSON.stringify(url) +
+                ';window.SUPABASE_ANON_KEY=' + JSON.stringify(key) + ';</script>';
+              html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, () => tag + '</body>') : html + tag;
+              fs.writeFileSync(entry, html);
+            }
+          }
+
+          console.log('MYAPPS_SUPABASE_ENV ' + JSON.stringify({ url: url, keyLength: key.length, files: ['.env', '.env.production', 'supabase.config.json'] }));
+          MYAPPS_SCRIPT
+          node /tmp/myapps-supabase-env.cjs desktop/app
           echo "The installers ship the app files, so they run without a connection."
 
       # Installers carry the app's own artwork. electron-builder converts the
