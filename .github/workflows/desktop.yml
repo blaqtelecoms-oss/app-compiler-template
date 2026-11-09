@@ -532,11 +532,15 @@ jobs:
             echo "No app icon was uploaded - using the default artwork."
             exit 0
           fi
-          if curl -sSL --fail "$ICON_URL" -o desktop/icon.png; then
+          # The Windows packager only reads real PNG artwork of at least 256x256;
+          # anything else aborts packaging, so the icon is checked before use.
+          PNG_CHECK='const fs=require("fs");const b=fs.readFileSync("desktop/icon.png");const sig=b[0]===0x89&&b[1]===0x50&&b[2]===0x4e&&b[3]===0x47;const w=sig?b.readUInt32BE(16):0;const h=sig?b.readUInt32BE(20):0;process.exit(sig&&w>=256&&h>=256?0:1)'
+          if curl -sSL --fail "$ICON_URL" -o desktop/icon.png && node -e "$PNG_CHECK"; then
             node -e 'const fs=require("fs");const p="desktop/package.json";const pkg=JSON.parse(fs.readFileSync(p,"utf8"));pkg.build.icon="icon.png";fs.writeFileSync(p,JSON.stringify(pkg,null,2));'
             echo "Applied the uploaded app icon"
           else
-            echo "::warning::The app icon could not be downloaded - using the default artwork."
+            rm -f desktop/icon.png
+            echo "::warning::The uploaded artwork is not a PNG of at least 256x256 - using the default artwork."
           fi
 
       # A splash screen is applied where the desktop runtime shows one: the
@@ -1163,11 +1167,15 @@ jobs:
             echo "No app icon was uploaded - using the default artwork."
             exit 0
           fi
-          if curl -sSL --fail "$ICON_URL" -o desktop/icon.png; then
+          # The Windows packager only reads real PNG artwork of at least 256x256;
+          # anything else aborts packaging, so the icon is checked before use.
+          PNG_CHECK='const fs=require("fs");const b=fs.readFileSync("desktop/icon.png");const sig=b[0]===0x89&&b[1]===0x50&&b[2]===0x4e&&b[3]===0x47;const w=sig?b.readUInt32BE(16):0;const h=sig?b.readUInt32BE(20):0;process.exit(sig&&w>=256&&h>=256?0:1)'
+          if curl -sSL --fail "$ICON_URL" -o desktop/icon.png && node -e "$PNG_CHECK"; then
             node -e 'const fs=require("fs");const p="desktop/package.json";const pkg=JSON.parse(fs.readFileSync(p,"utf8"));pkg.build.icon="icon.png";fs.writeFileSync(p,JSON.stringify(pkg,null,2));'
             echo "Applied the uploaded app icon"
           else
-            echo "::warning::The app icon could not be downloaded - using the default artwork."
+            rm -f desktop/icon.png
+            echo "::warning::The uploaded artwork is not a PNG of at least 256x256 - using the default artwork."
           fi
 
       # A splash screen is applied where the desktop runtime shows one: the
@@ -1794,11 +1802,15 @@ jobs:
             echo "No app icon was uploaded - using the default artwork."
             exit 0
           fi
-          if curl -sSL --fail "$ICON_URL" -o desktop/icon.png; then
+          # The Windows packager only reads real PNG artwork of at least 256x256;
+          # anything else aborts packaging, so the icon is checked before use.
+          PNG_CHECK='const fs=require("fs");const b=fs.readFileSync("desktop/icon.png");const sig=b[0]===0x89&&b[1]===0x50&&b[2]===0x4e&&b[3]===0x47;const w=sig?b.readUInt32BE(16):0;const h=sig?b.readUInt32BE(20):0;process.exit(sig&&w>=256&&h>=256?0:1)'
+          if curl -sSL --fail "$ICON_URL" -o desktop/icon.png && node -e "$PNG_CHECK"; then
             node -e 'const fs=require("fs");const p="desktop/package.json";const pkg=JSON.parse(fs.readFileSync(p,"utf8"));pkg.build.icon="icon.png";fs.writeFileSync(p,JSON.stringify(pkg,null,2));'
             echo "Applied the uploaded app icon"
           else
-            echo "::warning::The app icon could not be downloaded - using the default artwork."
+            rm -f desktop/icon.png
+            echo "::warning::The uploaded artwork is not a PNG of at least 256x256 - using the default artwork."
           fi
 
       # A splash screen is applied where the desktop runtime shows one: the
