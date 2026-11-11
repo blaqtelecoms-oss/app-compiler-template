@@ -214,7 +214,7 @@ jobs:
             "productName": "$APP_NAME",
             "version": "1.0.0",
             "main": "main.js",
-            "author": "MyApps Convertor",
+            "author": "MyApps Converter",
             "description": "$APP_NAME",
             "build": {
               "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "splash.html", "splash.*", "app/**/*"],
@@ -607,7 +607,7 @@ jobs:
             ls -1 desktop/dist || true
             exit 1
           fi
-          gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
+          gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Converter" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
           # GitHub rewrites characters it does not keep in an asset name (spaces
           # become dots), so the link is read back from the published release
           # instead of being guessed from the local file name.
@@ -849,7 +849,7 @@ jobs:
             "productName": "$APP_NAME",
             "version": "1.0.0",
             "main": "main.js",
-            "author": "MyApps Convertor",
+            "author": "MyApps Converter",
             "description": "$APP_NAME",
             "build": {
               "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "splash.html", "splash.*", "app/**/*"],
@@ -1242,7 +1242,7 @@ jobs:
             ls -1 desktop/dist || true
             exit 1
           fi
-          gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
+          gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Converter" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
           # GitHub rewrites characters it does not keep in an asset name (spaces
           # become dots), so the link is read back from the published release
           # instead of being guessed from the local file name.
@@ -1484,7 +1484,7 @@ jobs:
             "productName": "$APP_NAME",
             "version": "1.0.0",
             "main": "main.js",
-            "author": "MyApps Convertor",
+            "author": "MyApps Converter",
             "description": "$APP_NAME",
             "build": {
               "files": ["main.js", "local-origin.cjs", "verify-bundle.cjs", "config.json", "splash.html", "splash.*", "app/**/*"],
@@ -1877,7 +1877,7 @@ jobs:
             ls -1 desktop/dist || true
             exit 1
           fi
-          gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
+          gh release create "$TAG" "$FILE" --repo "${{ github.repository }}" --title "Desktop build $BUILD_ID" --notes "Compiled by MyApps Converter" >/dev/null || gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
           # GitHub rewrites characters it does not keep in an asset name (spaces
           # become dots), so the link is read back from the published release
           # instead of being guessed from the local file name.
