@@ -807,7 +807,7 @@ jobs:
           if (!fs.existsSync(file)) throw new Error('The Capacitor JSON configuration is missing.');
           const config = JSON.parse(fs.readFileSync(file, 'utf8'));
           config.webDir = 'www';
-          config.server = { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false };
+          config.server = { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false, allowNavigation: ['*'] };
           fs.writeFileSync(file, JSON.stringify(config, null, 2));
           console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED https://localhost capacitor://localhost webDir=www');
           MYAPPS_SCRIPT
@@ -1188,6 +1188,427 @@ jobs:
           console.log('MYAPPS_TV_WRAPPER_READY ' + JSON.stringify(checks));
           MYAPPS_SCRIPT
           node /tmp/myapps-verify-tv.cjs
+
+      - name: Keep links and downloads inside the app
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform||"android"')
+          if [ "$PLATFORM" = "ios" ]; then TARGET=ios; else TARGET=android; fi
+          mkdir -p wrapper/www
+          cat > /tmp/myapps-in-app-browser.js <<'MYAPPS_SCRIPT'
+          (function () {
+            if (window.__myappsInAppBrowser) return;
+            window.__myappsInAppBrowser = true;
+          
+            var DOWNLOAD = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|pdf|doc|docx|xls|xlsx|ppt|pptx|csv|txt|rtf|apk|ipa|dmg|pkg|exe|msi|appimage|deb|rpm|mp3|mp4|m4a|mov|avi|mkv|wav|flac|png|jpe?g|gif|webp|bmp|svg|epub|iso|bin)$/i;
+          
+            function send(url) {
+              try {
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.myappsDownloads) {
+                  window.webkit.messageHandlers.myappsDownloads.postMessage(url);
+                  return true;
+                }
+              } catch (error) {
+                return false;
+              }
+              return false;
+            }
+          
+            function isDownload(anchor, href) {
+              if (anchor.hasAttribute('download')) return true;
+              try {
+                return DOWNLOAD.test(new URL(href, window.location.href).pathname);
+              } catch (error) {
+                return false;
+              }
+            }
+          
+            document.addEventListener('click', function (event) {
+              var node = event.target;
+              if (!node || !node.closest) return;
+              var anchor = node.closest('a[href]');
+              if (!anchor) return;
+              var href = anchor.href;
+              if (!/^https?:/i.test(href)) return;
+              if (isDownload(anchor, href) && send(href)) {
+                event.preventDefault();
+                return;
+              }
+              if (anchor.target && anchor.target !== '_self') {
+                event.preventDefault();
+                window.location.href = href;
+              }
+            }, true);
+          
+            var open = window.open;
+            window.open = function (url) {
+              if (url && /^https?:/i.test(String(url))) {
+                if (send(String(url))) return window;
+                window.location.href = String(url);
+                return window;
+              }
+              return open ? open.apply(window, arguments) : null;
+            };
+          })();
+          MYAPPS_SCRIPT
+          cat > /tmp/myapps-watermark.js <<'MYAPPS_SCRIPT'
+          (function () {
+            if (window.__myappsWatermark) return;
+            window.__myappsWatermark = true;
+          
+            function paint() {
+              if (document.getElementById('myapps-watermark')) return;
+              var badge = document.createElement('div');
+              badge.id = 'myapps-watermark';
+              badge.setAttribute('role', 'note');
+              badge.textContent = 'Built with MyApps Converter';
+              badge.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);' +
+                'z-index:2147483647;pointer-events:none;padding:5px 11px;border-radius:999px;' +
+                'background:rgba(15,17,24,0.78);color:#fff;font:600 11px/1.2 -apple-system,BlinkMacSystemFont,' +
+                '"Segoe UI",Roboto,Helvetica,Arial,sans-serif;letter-spacing:0.01em;white-space:nowrap;' +
+                'box-shadow:0 6px 18px rgba(15,17,24,0.28);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);';
+              (document.body || document.documentElement).appendChild(badge);
+            }
+          
+            if (document.body) paint();
+            else document.addEventListener('DOMContentLoaded', paint);
+          })();
+          MYAPPS_SCRIPT
+          WATERMARK=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.watermark===false?"0":"1"')
+          if [ "$WATERMARK" = "1" ]; then cat /tmp/myapps-watermark.js >> /tmp/myapps-in-app-browser.js; fi
+          cat > /tmp/myapps-native-browser.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          
+          const target = process.argv[2] === 'ios' ? 'ios' : 'android';
+          const runtime = fs.readFileSync('/tmp/myapps-in-app-browser.js', 'utf8');
+          const MARKER = 'MYAPPS_IN_APP_BROWSER';
+          
+          function fail(message) {
+            console.log('::error::' + message);
+            process.exit(1);
+          }
+          
+          // 1. Capacitor hands a navigation to the system browser unless its host is in
+          //    allowNavigation. "*" keeps every page - and every window.open - inside the
+          //    app's own WebView on both Android and iOS.
+          const configFile = 'wrapper/capacitor.config.json';
+          if (!fs.existsSync(configFile)) fail('The Capacitor configuration is missing, so the app cannot keep links inside it.');
+          const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+          config.server = config.server || {};
+          config.server.allowNavigation = ['*'];
+          fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
+          
+          // 2. The link runtime travels with the web assets so the native side can inject
+          //    it into the bundled site and into a wrapped remote website alike.
+          fs.mkdirSync('wrapper/www', { recursive: true });
+          fs.writeFileSync('wrapper/www/myapps-browser.js', runtime);
+          
+          function walk(dir, match) {
+            if (!fs.existsSync(dir)) return [];
+            const found = [];
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) found.push(...walk(full, match));
+              else if (match(entry.name)) found.push(full);
+            }
+            return found;
+          }
+          
+          function patchAndroid() {
+            const root = 'wrapper/android/app/src/main/java';
+            const mainActivities = walk(root, (name) => name === 'MainActivity.java');
+            if (mainActivities.length === 0) {
+              console.log('::warning::The Android wrapper has no MainActivity to extend - links may still leave the app.');
+              return false;
+            }
+            const activity = mainActivities[0];
+            const folder = path.dirname(activity);
+            const source = fs.readFileSync(activity, 'utf8');
+            const packageName = (source.match(/^\s*package\s+([\w.]+)\s*;/m) || [])[1];
+            if (!packageName) fail('The Android MainActivity has no package name.');
+          
+            const downloads = path.join(folder, 'MyAppsDownloads.java');
+            fs.writeFileSync(
+              downloads,
+              [
+                'package ' + packageName + ';',
+                '',
+                'import android.app.DownloadManager;',
+                'import android.content.Context;',
+                'import android.net.Uri;',
+                'import android.os.Environment;',
+                'import android.webkit.CookieManager;',
+                'import android.webkit.DownloadListener;',
+                'import android.webkit.URLUtil;',
+                'import android.widget.Toast;',
+                'import java.io.ByteArrayOutputStream;',
+                'import java.io.InputStream;',
+                'import java.nio.charset.StandardCharsets;',
+                '',
+                '/** Saves files opened in the app browser into the device Downloads folder. */',
+                'public class MyAppsDownloads implements DownloadListener {',
+                '    private final Context context;',
+                '',
+                '    public MyAppsDownloads(Context context) {',
+                '        this.context = context;',
+                '    }',
+                '',
+                '    /** The in-app link runtime shipped with the web assets. */',
+                '    public static String readBrowserScript(Context context) {',
+                '        try (InputStream input = context.getAssets().open("public/myapps-browser.js")) {',
+                '            ByteArrayOutputStream out = new ByteArrayOutputStream();',
+                '            byte[] buffer = new byte[4096];',
+                '            int read;',
+                '            while ((read = input.read(buffer)) != -1) out.write(buffer, 0, read);',
+                '            return new String(out.toByteArray(), StandardCharsets.UTF_8);',
+                '        } catch (Exception error) {',
+                '            return null;',
+                '        }',
+                '    }',
+                '',
+                '    @Override',
+                '    public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimeType, long contentLength) {',
+                '        if (url == null || !(url.startsWith("http://") || url.startsWith("https://"))) {',
+                '            Toast.makeText(context, "This download could not be started.", Toast.LENGTH_SHORT).show();',
+                '            return;',
+                '        }',
+                '        try {',
+                '            DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));',
+                '            if (mimeType != null) request.setMimeType(mimeType);',
+                '            String cookies = CookieManager.getInstance().getCookie(url);',
+                '            if (cookies != null) request.addRequestHeader("Cookie", cookies);',
+                '            if (userAgent != null) request.addRequestHeader("User-Agent", userAgent);',
+                '            String name = URLUtil.guessFileName(url, contentDisposition, mimeType);',
+                '            request.setTitle(name);',
+                '            request.setDescription("Saved to Downloads");',
+                '            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);',
+                '            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);',
+                '            DownloadManager manager = (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE);',
+                '            manager.enqueue(request);',
+                '            Toast.makeText(context, "Saving " + name + " to Downloads", Toast.LENGTH_SHORT).show();',
+                '        } catch (Exception error) {',
+                '            Toast.makeText(context, "The download could not be saved.", Toast.LENGTH_LONG).show();',
+                '        }',
+                '    }',
+                '}',
+                '',
+              ].join('\n')
+            );
+          
+            if (!source.includes(MARKER)) {
+              const setup = [
+                '    // ' + MARKER + ': links stay in this WebView and files save to Downloads.',
+                '    android.webkit.WebView myappsWebView = getBridge().getWebView();',
+                '    if (myappsWebView != null) {',
+                '      myappsWebView.getSettings().setSupportMultipleWindows(false);',
+                '      myappsWebView.setDownloadListener(new MyAppsDownloads(this));',
+                '      final String myappsScript = MyAppsDownloads.readBrowserScript(this);',
+                '      if (myappsScript != null) {',
+                '        getBridge().addWebViewListener(new com.getcapacitor.WebViewListener() {',
+                '          @Override',
+                '          public void onPageLoaded(android.webkit.WebView view) {',
+                '            view.evaluateJavascript(myappsScript, null);',
+                '          }',
+                '        });',
+                '      }',
+                '    }',
+              ].join('\n');
+          
+              let patched = source;
+              if (/super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;/.test(source)) {
+                patched = source.replace(/(super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;)/, '$1\n' + setup);
+              } else if (/class\s+MainActivity\s+extends\s+BridgeActivity\s*\{\s*\}/.test(source)) {
+                patched = source.replace(
+                  /class\s+MainActivity\s+extends\s+BridgeActivity\s*\{\s*\}/,
+                  [
+                    'class MainActivity extends BridgeActivity {',
+                    '  @Override',
+                    '  public void onCreate(android.os.Bundle savedInstanceState) {',
+                    '    super.onCreate(savedInstanceState);',
+                    setup,
+                    '  }',
+                    '}',
+                  ].join('\n')
+                );
+              } else {
+                fail('The Android MainActivity could not be extended with the in-app browser.');
+              }
+              fs.writeFileSync(activity, patched);
+            }
+          
+            // Downloads on Android 9 and older need this to write to the public folder.
+            const manifest = 'wrapper/android/app/src/main/AndroidManifest.xml';
+            let xml = fs.readFileSync(manifest, 'utf8');
+            if (!xml.includes('WRITE_EXTERNAL_STORAGE')) {
+              xml = xml.replace(
+                /(<manifest\b[^>]*>)/,
+                '$1\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />'
+              );
+              fs.writeFileSync(manifest, xml);
+            }
+            console.log('MYAPPS_BROWSER_READY ' + JSON.stringify({ target: 'android', activity, downloads: true }));
+            return true;
+          }
+          
+          function patchIos() {
+            const appDelegate = 'wrapper/ios/App/App/AppDelegate.swift';
+            if (!fs.existsSync(appDelegate)) {
+              console.log('::warning::The iOS wrapper has no AppDelegate to extend - links may still leave the app.');
+              return false;
+            }
+            let swift = fs.readFileSync(appDelegate, 'utf8');
+            if (!/^\s*import WebKit\s*$/m.test(swift)) {
+              swift = /^\s*import\s+Capacitor\s*$/m.test(swift)
+                ? swift.replace(/^(\s*import\s+Capacitor\s*$)/m, '$1\nimport WebKit')
+                : swift.replace(/^(\s*import\s+UIKit\s*$)/m, '$1\nimport WebKit');
+            }
+            if (!swift.includes(MARKER)) {
+              swift += [
+                '',
+                '// ' + MARKER + ': every link opens inside this app and downloads are saved to Files.',
+                '@objc(MyAppsBrowserViewController)',
+                'public class MyAppsBrowserViewController: CAPBridgeViewController, WKScriptMessageHandler, URLSessionDownloadDelegate {',
+                '  private var dialog: UIAlertController?',
+                '  private lazy var downloadSession: URLSession = URLSession(configuration: .default, delegate: self, delegateQueue: .main)',
+                '',
+                '  private func browserScript() -> String? {',
+                '    guard let file = Bundle.main.path(forResource: "myapps-browser", ofType: "js", inDirectory: "public") else { return nil }',
+                '    return try? String(contentsOfFile: file, encoding: .utf8)',
+                '  }',
+                '',
+                '  override public func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {',
+                '    let configuration = super.webViewConfiguration(for: instanceConfiguration)',
+                '    configuration.userContentController.add(self, name: "myappsDownloads")',
+                '    if let script = browserScript() {',
+                '      let userScript = WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true)',
+                '      configuration.userContentController.addUserScript(userScript)',
+                '    }',
+                '    return configuration',
+                '  }',
+                '',
+                '  public func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {',
+                '    guard message.name == "myappsDownloads", let text = message.body as? String, let url = URL(string: text) else { return }',
+                '    let name = url.lastPathComponent.isEmpty ? "download" : url.lastPathComponent',
+                '    show(title: "Downloading", message: name)',
+                '    let task = downloadSession.downloadTask(with: url)',
+                '    task.taskDescription = name',
+                '    task.resume()',
+                '  }',
+                '',
+                '  private func show(title: String, message: String) {',
+                '    DispatchQueue.main.async {',
+                '      if let dialog = self.dialog {',
+                '        dialog.title = title',
+                '        dialog.message = message',
+                '        return',
+                '      }',
+                '      let dialog = UIAlertController(title: title, message: message, preferredStyle: .alert)',
+                '      dialog.addAction(UIAlertAction(title: "Hide", style: .cancel, handler: { _ in self.dialog = nil }))',
+                '      self.present(dialog, animated: true, completion: { self.dialog = dialog })',
+                '    }',
+                '  }',
+                '',
+                '  private func finish(title: String, message: String) {',
+                '    DispatchQueue.main.async {',
+                '      self.dialog?.dismiss(animated: true, completion: { self.dialog = nil })',
+                '      let dialog = UIAlertController(title: title, message: message, preferredStyle: .alert)',
+                '      dialog.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))',
+                '      self.present(dialog, animated: true, completion: nil)',
+                '    }',
+                '  }',
+                '',
+                '  public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {',
+                '    guard totalBytesExpectedToWrite > 0 else { return }',
+                '    let percent = Int((Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)) * 100)',
+                '    show(title: "Downloading", message: (downloadTask.taskDescription ?? "file") + " - " + String(percent) + "%")',
+                '  }',
+                '',
+                '  public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {',
+                '    let name = downloadTask.taskDescription ?? "download"',
+                '    guard let folder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {',
+                '      finish(title: "Download failed", message: "The file could not be saved.")',
+                '      return',
+                '    }',
+                '    var target = folder.appendingPathComponent(name)',
+                '    let base = target.deletingPathExtension().lastPathComponent',
+                '    let extensionName = target.pathExtension',
+                '    var index = 1',
+                '    while FileManager.default.fileExists(atPath: target.path) {',
+                '      target = folder.appendingPathComponent(base + " (" + String(index) + ")" + (extensionName.isEmpty ? "" : "." + extensionName))',
+                '      index += 1',
+                '    }',
+                '    do {',
+                '      try FileManager.default.moveItem(at: location, to: target)',
+                '      finish(title: "Download complete", message: name + " is saved in the Files app.")',
+                '    } catch {',
+                '      finish(title: "Download failed", message: "The file could not be saved.")',
+                '    }',
+                '  }',
+                '',
+                '  public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {',
+                '    guard error != nil else { return }',
+                '    finish(title: "Download failed", message: "Check the connection and try again.")',
+                '  }',
+                '}',
+                '',
+              ].join('\n');
+              fs.writeFileSync(appDelegate, swift);
+            }
+          
+            // The storyboard must instantiate the browser view controller, not the plain one.
+            const storyboards = walk('wrapper/ios/App/App', (name) => name === 'Main.storyboard');
+            let wired = false;
+            for (const storyboard of storyboards) {
+              let xml = fs.readFileSync(storyboard, 'utf8');
+              if (xml.includes('MyAppsBrowserViewController')) {
+                wired = true;
+                continue;
+              }
+              // No customModule: the class lives in the app's own target, so Interface
+              // Builder resolves it in whatever module the generated project uses.
+              const next = xml.replace(
+                /customClass="CAPBridgeViewController"(\s+customModule="Capacitor")?(\s+customModuleProvider="target")?/,
+                'customClass="MyAppsBrowserViewController" customModuleProvider="target"'
+              );
+              if (next !== xml) {
+                fs.writeFileSync(storyboard, next);
+                wired = true;
+              }
+            }
+            if (!wired) {
+              console.log('::warning::The iOS storyboard could not be pointed at the in-app browser.');
+              return false;
+            }
+          
+            // Saved downloads are visible in the Files app next to the app.
+            const plist = 'wrapper/ios/App/App/Info.plist';
+            if (fs.existsSync(plist)) {
+              let xml = fs.readFileSync(plist, 'utf8');
+              const keys = ['UIFileSharingEnabled', 'LSSupportsOpeningDocumentsInPlace'];
+              const missing = keys.filter((key) => !xml.includes('<key>' + key + '</key>'));
+              if (missing.length) {
+                const entries = missing
+                  .map((key) => '  <key>' + key + '</key>\n  <true/>')
+                  .join('\n');
+                xml = xml.replace(/<\/dict>\s*<\/plist>\s*$/, entries + '\n</dict>\n</plist>\n');
+                fs.writeFileSync(plist, xml);
+              }
+            }
+            console.log('MYAPPS_BROWSER_READY ' + JSON.stringify({ target: 'ios', storyboard: true, downloads: true }));
+            return true;
+          }
+          
+          // A wrapper that cannot be extended is reported above; the build still runs so
+          // the installer is produced with the platform's standard link handling.
+          if (target === 'ios') patchIos();
+          else patchAndroid();
+          MYAPPS_SCRIPT
+          node /tmp/myapps-native-browser.cjs "$TARGET"
+          (cd wrapper && npx cap copy "$TARGET")
 
       - name: Compile the APK
         working-directory: wrapper/android
@@ -1996,7 +2417,7 @@ jobs:
           if (!fs.existsSync(file)) throw new Error('The Capacitor JSON configuration is missing.');
           const config = JSON.parse(fs.readFileSync(file, 'utf8'));
           config.webDir = 'www';
-          config.server = { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false };
+          config.server = { hostname: 'localhost', androidScheme: 'https', iosScheme: 'capacitor', cleartext: false, allowNavigation: ['*'] };
           fs.writeFileSync(file, JSON.stringify(config, null, 2));
           console.log('MYAPPS_LOCAL_ORIGIN_CONFIGURED https://localhost capacitor://localhost webDir=www');
           MYAPPS_SCRIPT
@@ -2051,6 +2472,427 @@ jobs:
           MYAPPS_SCRIPT
           PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD).platform||"android"')
           node /tmp/myapps-verify-mobile.cjs "$PLATFORM"
+
+      - name: Keep links and downloads inside the app
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform||"android"')
+          if [ "$PLATFORM" = "ios" ]; then TARGET=ios; else TARGET=android; fi
+          mkdir -p wrapper/www
+          cat > /tmp/myapps-in-app-browser.js <<'MYAPPS_SCRIPT'
+          (function () {
+            if (window.__myappsInAppBrowser) return;
+            window.__myappsInAppBrowser = true;
+          
+            var DOWNLOAD = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|pdf|doc|docx|xls|xlsx|ppt|pptx|csv|txt|rtf|apk|ipa|dmg|pkg|exe|msi|appimage|deb|rpm|mp3|mp4|m4a|mov|avi|mkv|wav|flac|png|jpe?g|gif|webp|bmp|svg|epub|iso|bin)$/i;
+          
+            function send(url) {
+              try {
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.myappsDownloads) {
+                  window.webkit.messageHandlers.myappsDownloads.postMessage(url);
+                  return true;
+                }
+              } catch (error) {
+                return false;
+              }
+              return false;
+            }
+          
+            function isDownload(anchor, href) {
+              if (anchor.hasAttribute('download')) return true;
+              try {
+                return DOWNLOAD.test(new URL(href, window.location.href).pathname);
+              } catch (error) {
+                return false;
+              }
+            }
+          
+            document.addEventListener('click', function (event) {
+              var node = event.target;
+              if (!node || !node.closest) return;
+              var anchor = node.closest('a[href]');
+              if (!anchor) return;
+              var href = anchor.href;
+              if (!/^https?:/i.test(href)) return;
+              if (isDownload(anchor, href) && send(href)) {
+                event.preventDefault();
+                return;
+              }
+              if (anchor.target && anchor.target !== '_self') {
+                event.preventDefault();
+                window.location.href = href;
+              }
+            }, true);
+          
+            var open = window.open;
+            window.open = function (url) {
+              if (url && /^https?:/i.test(String(url))) {
+                if (send(String(url))) return window;
+                window.location.href = String(url);
+                return window;
+              }
+              return open ? open.apply(window, arguments) : null;
+            };
+          })();
+          MYAPPS_SCRIPT
+          cat > /tmp/myapps-watermark.js <<'MYAPPS_SCRIPT'
+          (function () {
+            if (window.__myappsWatermark) return;
+            window.__myappsWatermark = true;
+          
+            function paint() {
+              if (document.getElementById('myapps-watermark')) return;
+              var badge = document.createElement('div');
+              badge.id = 'myapps-watermark';
+              badge.setAttribute('role', 'note');
+              badge.textContent = 'Built with MyApps Converter';
+              badge.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);' +
+                'z-index:2147483647;pointer-events:none;padding:5px 11px;border-radius:999px;' +
+                'background:rgba(15,17,24,0.78);color:#fff;font:600 11px/1.2 -apple-system,BlinkMacSystemFont,' +
+                '"Segoe UI",Roboto,Helvetica,Arial,sans-serif;letter-spacing:0.01em;white-space:nowrap;' +
+                'box-shadow:0 6px 18px rgba(15,17,24,0.28);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);';
+              (document.body || document.documentElement).appendChild(badge);
+            }
+          
+            if (document.body) paint();
+            else document.addEventListener('DOMContentLoaded', paint);
+          })();
+          MYAPPS_SCRIPT
+          WATERMARK=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); c.watermark===false?"0":"1"')
+          if [ "$WATERMARK" = "1" ]; then cat /tmp/myapps-watermark.js >> /tmp/myapps-in-app-browser.js; fi
+          cat > /tmp/myapps-native-browser.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          
+          const target = process.argv[2] === 'ios' ? 'ios' : 'android';
+          const runtime = fs.readFileSync('/tmp/myapps-in-app-browser.js', 'utf8');
+          const MARKER = 'MYAPPS_IN_APP_BROWSER';
+          
+          function fail(message) {
+            console.log('::error::' + message);
+            process.exit(1);
+          }
+          
+          // 1. Capacitor hands a navigation to the system browser unless its host is in
+          //    allowNavigation. "*" keeps every page - and every window.open - inside the
+          //    app's own WebView on both Android and iOS.
+          const configFile = 'wrapper/capacitor.config.json';
+          if (!fs.existsSync(configFile)) fail('The Capacitor configuration is missing, so the app cannot keep links inside it.');
+          const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+          config.server = config.server || {};
+          config.server.allowNavigation = ['*'];
+          fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
+          
+          // 2. The link runtime travels with the web assets so the native side can inject
+          //    it into the bundled site and into a wrapped remote website alike.
+          fs.mkdirSync('wrapper/www', { recursive: true });
+          fs.writeFileSync('wrapper/www/myapps-browser.js', runtime);
+          
+          function walk(dir, match) {
+            if (!fs.existsSync(dir)) return [];
+            const found = [];
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) found.push(...walk(full, match));
+              else if (match(entry.name)) found.push(full);
+            }
+            return found;
+          }
+          
+          function patchAndroid() {
+            const root = 'wrapper/android/app/src/main/java';
+            const mainActivities = walk(root, (name) => name === 'MainActivity.java');
+            if (mainActivities.length === 0) {
+              console.log('::warning::The Android wrapper has no MainActivity to extend - links may still leave the app.');
+              return false;
+            }
+            const activity = mainActivities[0];
+            const folder = path.dirname(activity);
+            const source = fs.readFileSync(activity, 'utf8');
+            const packageName = (source.match(/^\s*package\s+([\w.]+)\s*;/m) || [])[1];
+            if (!packageName) fail('The Android MainActivity has no package name.');
+          
+            const downloads = path.join(folder, 'MyAppsDownloads.java');
+            fs.writeFileSync(
+              downloads,
+              [
+                'package ' + packageName + ';',
+                '',
+                'import android.app.DownloadManager;',
+                'import android.content.Context;',
+                'import android.net.Uri;',
+                'import android.os.Environment;',
+                'import android.webkit.CookieManager;',
+                'import android.webkit.DownloadListener;',
+                'import android.webkit.URLUtil;',
+                'import android.widget.Toast;',
+                'import java.io.ByteArrayOutputStream;',
+                'import java.io.InputStream;',
+                'import java.nio.charset.StandardCharsets;',
+                '',
+                '/** Saves files opened in the app browser into the device Downloads folder. */',
+                'public class MyAppsDownloads implements DownloadListener {',
+                '    private final Context context;',
+                '',
+                '    public MyAppsDownloads(Context context) {',
+                '        this.context = context;',
+                '    }',
+                '',
+                '    /** The in-app link runtime shipped with the web assets. */',
+                '    public static String readBrowserScript(Context context) {',
+                '        try (InputStream input = context.getAssets().open("public/myapps-browser.js")) {',
+                '            ByteArrayOutputStream out = new ByteArrayOutputStream();',
+                '            byte[] buffer = new byte[4096];',
+                '            int read;',
+                '            while ((read = input.read(buffer)) != -1) out.write(buffer, 0, read);',
+                '            return new String(out.toByteArray(), StandardCharsets.UTF_8);',
+                '        } catch (Exception error) {',
+                '            return null;',
+                '        }',
+                '    }',
+                '',
+                '    @Override',
+                '    public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimeType, long contentLength) {',
+                '        if (url == null || !(url.startsWith("http://") || url.startsWith("https://"))) {',
+                '            Toast.makeText(context, "This download could not be started.", Toast.LENGTH_SHORT).show();',
+                '            return;',
+                '        }',
+                '        try {',
+                '            DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));',
+                '            if (mimeType != null) request.setMimeType(mimeType);',
+                '            String cookies = CookieManager.getInstance().getCookie(url);',
+                '            if (cookies != null) request.addRequestHeader("Cookie", cookies);',
+                '            if (userAgent != null) request.addRequestHeader("User-Agent", userAgent);',
+                '            String name = URLUtil.guessFileName(url, contentDisposition, mimeType);',
+                '            request.setTitle(name);',
+                '            request.setDescription("Saved to Downloads");',
+                '            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);',
+                '            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);',
+                '            DownloadManager manager = (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE);',
+                '            manager.enqueue(request);',
+                '            Toast.makeText(context, "Saving " + name + " to Downloads", Toast.LENGTH_SHORT).show();',
+                '        } catch (Exception error) {',
+                '            Toast.makeText(context, "The download could not be saved.", Toast.LENGTH_LONG).show();',
+                '        }',
+                '    }',
+                '}',
+                '',
+              ].join('\n')
+            );
+          
+            if (!source.includes(MARKER)) {
+              const setup = [
+                '    // ' + MARKER + ': links stay in this WebView and files save to Downloads.',
+                '    android.webkit.WebView myappsWebView = getBridge().getWebView();',
+                '    if (myappsWebView != null) {',
+                '      myappsWebView.getSettings().setSupportMultipleWindows(false);',
+                '      myappsWebView.setDownloadListener(new MyAppsDownloads(this));',
+                '      final String myappsScript = MyAppsDownloads.readBrowserScript(this);',
+                '      if (myappsScript != null) {',
+                '        getBridge().addWebViewListener(new com.getcapacitor.WebViewListener() {',
+                '          @Override',
+                '          public void onPageLoaded(android.webkit.WebView view) {',
+                '            view.evaluateJavascript(myappsScript, null);',
+                '          }',
+                '        });',
+                '      }',
+                '    }',
+              ].join('\n');
+          
+              let patched = source;
+              if (/super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;/.test(source)) {
+                patched = source.replace(/(super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;)/, '$1\n' + setup);
+              } else if (/class\s+MainActivity\s+extends\s+BridgeActivity\s*\{\s*\}/.test(source)) {
+                patched = source.replace(
+                  /class\s+MainActivity\s+extends\s+BridgeActivity\s*\{\s*\}/,
+                  [
+                    'class MainActivity extends BridgeActivity {',
+                    '  @Override',
+                    '  public void onCreate(android.os.Bundle savedInstanceState) {',
+                    '    super.onCreate(savedInstanceState);',
+                    setup,
+                    '  }',
+                    '}',
+                  ].join('\n')
+                );
+              } else {
+                fail('The Android MainActivity could not be extended with the in-app browser.');
+              }
+              fs.writeFileSync(activity, patched);
+            }
+          
+            // Downloads on Android 9 and older need this to write to the public folder.
+            const manifest = 'wrapper/android/app/src/main/AndroidManifest.xml';
+            let xml = fs.readFileSync(manifest, 'utf8');
+            if (!xml.includes('WRITE_EXTERNAL_STORAGE')) {
+              xml = xml.replace(
+                /(<manifest\b[^>]*>)/,
+                '$1\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />'
+              );
+              fs.writeFileSync(manifest, xml);
+            }
+            console.log('MYAPPS_BROWSER_READY ' + JSON.stringify({ target: 'android', activity, downloads: true }));
+            return true;
+          }
+          
+          function patchIos() {
+            const appDelegate = 'wrapper/ios/App/App/AppDelegate.swift';
+            if (!fs.existsSync(appDelegate)) {
+              console.log('::warning::The iOS wrapper has no AppDelegate to extend - links may still leave the app.');
+              return false;
+            }
+            let swift = fs.readFileSync(appDelegate, 'utf8');
+            if (!/^\s*import WebKit\s*$/m.test(swift)) {
+              swift = /^\s*import\s+Capacitor\s*$/m.test(swift)
+                ? swift.replace(/^(\s*import\s+Capacitor\s*$)/m, '$1\nimport WebKit')
+                : swift.replace(/^(\s*import\s+UIKit\s*$)/m, '$1\nimport WebKit');
+            }
+            if (!swift.includes(MARKER)) {
+              swift += [
+                '',
+                '// ' + MARKER + ': every link opens inside this app and downloads are saved to Files.',
+                '@objc(MyAppsBrowserViewController)',
+                'public class MyAppsBrowserViewController: CAPBridgeViewController, WKScriptMessageHandler, URLSessionDownloadDelegate {',
+                '  private var dialog: UIAlertController?',
+                '  private lazy var downloadSession: URLSession = URLSession(configuration: .default, delegate: self, delegateQueue: .main)',
+                '',
+                '  private func browserScript() -> String? {',
+                '    guard let file = Bundle.main.path(forResource: "myapps-browser", ofType: "js", inDirectory: "public") else { return nil }',
+                '    return try? String(contentsOfFile: file, encoding: .utf8)',
+                '  }',
+                '',
+                '  override public func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {',
+                '    let configuration = super.webViewConfiguration(for: instanceConfiguration)',
+                '    configuration.userContentController.add(self, name: "myappsDownloads")',
+                '    if let script = browserScript() {',
+                '      let userScript = WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true)',
+                '      configuration.userContentController.addUserScript(userScript)',
+                '    }',
+                '    return configuration',
+                '  }',
+                '',
+                '  public func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {',
+                '    guard message.name == "myappsDownloads", let text = message.body as? String, let url = URL(string: text) else { return }',
+                '    let name = url.lastPathComponent.isEmpty ? "download" : url.lastPathComponent',
+                '    show(title: "Downloading", message: name)',
+                '    let task = downloadSession.downloadTask(with: url)',
+                '    task.taskDescription = name',
+                '    task.resume()',
+                '  }',
+                '',
+                '  private func show(title: String, message: String) {',
+                '    DispatchQueue.main.async {',
+                '      if let dialog = self.dialog {',
+                '        dialog.title = title',
+                '        dialog.message = message',
+                '        return',
+                '      }',
+                '      let dialog = UIAlertController(title: title, message: message, preferredStyle: .alert)',
+                '      dialog.addAction(UIAlertAction(title: "Hide", style: .cancel, handler: { _ in self.dialog = nil }))',
+                '      self.present(dialog, animated: true, completion: { self.dialog = dialog })',
+                '    }',
+                '  }',
+                '',
+                '  private func finish(title: String, message: String) {',
+                '    DispatchQueue.main.async {',
+                '      self.dialog?.dismiss(animated: true, completion: { self.dialog = nil })',
+                '      let dialog = UIAlertController(title: title, message: message, preferredStyle: .alert)',
+                '      dialog.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))',
+                '      self.present(dialog, animated: true, completion: nil)',
+                '    }',
+                '  }',
+                '',
+                '  public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {',
+                '    guard totalBytesExpectedToWrite > 0 else { return }',
+                '    let percent = Int((Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)) * 100)',
+                '    show(title: "Downloading", message: (downloadTask.taskDescription ?? "file") + " - " + String(percent) + "%")',
+                '  }',
+                '',
+                '  public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {',
+                '    let name = downloadTask.taskDescription ?? "download"',
+                '    guard let folder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {',
+                '      finish(title: "Download failed", message: "The file could not be saved.")',
+                '      return',
+                '    }',
+                '    var target = folder.appendingPathComponent(name)',
+                '    let base = target.deletingPathExtension().lastPathComponent',
+                '    let extensionName = target.pathExtension',
+                '    var index = 1',
+                '    while FileManager.default.fileExists(atPath: target.path) {',
+                '      target = folder.appendingPathComponent(base + " (" + String(index) + ")" + (extensionName.isEmpty ? "" : "." + extensionName))',
+                '      index += 1',
+                '    }',
+                '    do {',
+                '      try FileManager.default.moveItem(at: location, to: target)',
+                '      finish(title: "Download complete", message: name + " is saved in the Files app.")',
+                '    } catch {',
+                '      finish(title: "Download failed", message: "The file could not be saved.")',
+                '    }',
+                '  }',
+                '',
+                '  public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {',
+                '    guard error != nil else { return }',
+                '    finish(title: "Download failed", message: "Check the connection and try again.")',
+                '  }',
+                '}',
+                '',
+              ].join('\n');
+              fs.writeFileSync(appDelegate, swift);
+            }
+          
+            // The storyboard must instantiate the browser view controller, not the plain one.
+            const storyboards = walk('wrapper/ios/App/App', (name) => name === 'Main.storyboard');
+            let wired = false;
+            for (const storyboard of storyboards) {
+              let xml = fs.readFileSync(storyboard, 'utf8');
+              if (xml.includes('MyAppsBrowserViewController')) {
+                wired = true;
+                continue;
+              }
+              // No customModule: the class lives in the app's own target, so Interface
+              // Builder resolves it in whatever module the generated project uses.
+              const next = xml.replace(
+                /customClass="CAPBridgeViewController"(\s+customModule="Capacitor")?(\s+customModuleProvider="target")?/,
+                'customClass="MyAppsBrowserViewController" customModuleProvider="target"'
+              );
+              if (next !== xml) {
+                fs.writeFileSync(storyboard, next);
+                wired = true;
+              }
+            }
+            if (!wired) {
+              console.log('::warning::The iOS storyboard could not be pointed at the in-app browser.');
+              return false;
+            }
+          
+            // Saved downloads are visible in the Files app next to the app.
+            const plist = 'wrapper/ios/App/App/Info.plist';
+            if (fs.existsSync(plist)) {
+              let xml = fs.readFileSync(plist, 'utf8');
+              const keys = ['UIFileSharingEnabled', 'LSSupportsOpeningDocumentsInPlace'];
+              const missing = keys.filter((key) => !xml.includes('<key>' + key + '</key>'));
+              if (missing.length) {
+                const entries = missing
+                  .map((key) => '  <key>' + key + '</key>\n  <true/>')
+                  .join('\n');
+                xml = xml.replace(/<\/dict>\s*<\/plist>\s*$/, entries + '\n</dict>\n</plist>\n');
+                fs.writeFileSync(plist, xml);
+              }
+            }
+            console.log('MYAPPS_BROWSER_READY ' + JSON.stringify({ target: 'ios', storyboard: true, downloads: true }));
+            return true;
+          }
+          
+          // A wrapper that cannot be extended is reported above; the build still runs so
+          // the installer is produced with the platform's standard link handling.
+          if (target === 'ios') patchIos();
+          else patchAndroid();
+          MYAPPS_SCRIPT
+          node /tmp/myapps-native-browser.cjs "$TARGET"
+          (cd wrapper && npx cap copy "$TARGET")
 
       - name: Compile and sign the iOS app
         env:
