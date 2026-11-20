@@ -1610,6 +1610,265 @@ jobs:
           node /tmp/myapps-native-browser.cjs "$TARGET"
           (cd wrapper && npx cap copy "$TARGET")
 
+      - name: Apply the app permissions
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform||"android"')
+          if [ "$PLATFORM" = "ios" ]; then TARGET=ios; else TARGET=android; fi
+          ENABLED=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); JSON.stringify(Array.isArray(c.permissions)?c.permissions:[])')
+          if [ "$ENABLED" = "[]" ]; then echo "No permissions requested for this build."; exit 0; fi
+          echo "Permissions for $TARGET: $ENABLED"
+          printf 'window.__myappsPermissionsEnabled = %s;\n' "$ENABLED" > /tmp/myapps-permissions-enabled.js
+          node -e 'const fs=require("fs");const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{});fs.writeFileSync("/tmp/myapps-permissions.json",JSON.stringify({target:process.argv[1],permissions:Array.isArray(c.permissions)?c.permissions:[]}))' "$TARGET"
+          cat > /tmp/myapps-permissions-runtime.js <<'MYAPPS_SCRIPT'
+          (function () {
+            var enabled = Array.isArray(window.__myappsPermissionsEnabled) ? window.__myappsPermissionsEnabled : [];
+          
+            function allowed(value) {
+              return value === true || value === 'granted';
+            }
+          
+            function askPush() {
+              try {
+                // Android asks through the native bridge; a browser shell can ask itself.
+                if (window.MyAppsPermissionsBridge && window.MyAppsPermissionsBridge.requestPush) {
+                  window.MyAppsPermissionsBridge.requestPush();
+                  return Promise.resolve(true);
+                }
+                if (window.Notification && window.Notification.requestPermission) {
+                  return Promise.resolve(window.Notification.requestPermission()).then(allowed, function () { return false; });
+                }
+              } catch (error) {}
+              return Promise.resolve(false);
+            }
+          
+            function askMedia(constraints) {
+              try {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.resolve(false);
+                return navigator.mediaDevices.getUserMedia(constraints).then(function (stream) {
+                  stream.getTracks().forEach(function (track) { track.stop(); });
+                  return true;
+                }, function () { return false; });
+              } catch (error) {
+                return Promise.resolve(false);
+              }
+            }
+          
+            function askLocation() {
+              try {
+                if (!navigator.geolocation) return Promise.resolve(false);
+                return new Promise(function (resolve) {
+                  navigator.geolocation.getCurrentPosition(
+                    function () { resolve(true); },
+                    function () { resolve(false); },
+                    { timeout: 15000 }
+                  );
+                });
+              } catch (error) {
+                return Promise.resolve(false);
+              }
+            }
+          
+            function request(name) {
+              if (enabled.indexOf(name) === -1) return Promise.resolve(false);
+              if (name === 'push') return askPush();
+              if (name === 'camera') return askMedia({ video: true });
+              if (name === 'microphone') return askMedia({ audio: true });
+              if (name === 'location') return askLocation();
+              // The system asks for library access the first time a file is picked.
+              if (name === 'photos') return Promise.resolve(true);
+              return Promise.resolve(false);
+            }
+          
+            window.MyAppsPermissions = {
+              enabled: enabled,
+              has: function (name) { return enabled.indexOf(name) !== -1; },
+              request: request
+            };
+          
+            // Only notifications are asked for up front; the rest wait for real use.
+            if (enabled.indexOf('push') !== -1) setTimeout(function () { request('push'); }, 1800);
+          })();
+          MYAPPS_SCRIPT
+          cat > /tmp/myapps-permissions.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          
+          const configPath = '/tmp/myapps-permissions.json';
+          const config = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, 'utf8')) : {};
+          const target = config.target === 'ios' ? 'ios' : 'android';
+          const permissions = Array.isArray(config.permissions) ? config.permissions : [];
+          
+          const ANDROID = {
+            push: ['android.permission.POST_NOTIFICATIONS'],
+            camera: ['android.permission.CAMERA'],
+            microphone: ['android.permission.RECORD_AUDIO'],
+            location: ['android.permission.ACCESS_COARSE_LOCATION', 'android.permission.ACCESS_FINE_LOCATION'],
+            photos: ['android.permission.READ_MEDIA_IMAGES', 'android.permission.READ_EXTERNAL_STORAGE'],
+          };
+          
+          const IOS = {
+            camera: ['NSCameraUsageDescription', 'This app uses the camera when you take a photo or scan a document.'],
+            microphone: ['NSMicrophoneUsageDescription', 'This app uses the microphone when you record audio.'],
+            location: ['NSLocationWhenInUseUsageDescription', 'This app uses your location while you are using it.'],
+            photos: ['NSPhotoLibraryUsageDescription', 'This app lets you choose photos from your library.'],
+          };
+          
+          function warn(message) {
+            console.log('::warning::' + message);
+          }
+          
+          function patchManifest(entries) {
+            const file = 'wrapper/android/app/src/main/AndroidManifest.xml';
+            if (!fs.existsSync(file)) {
+              warn('The Android manifest is missing, so permissions could not be declared.');
+              return false;
+            }
+            let xml = fs.readFileSync(file, 'utf8');
+            const missing = entries.filter((name) => !xml.includes('android:name="' + name + '"'));
+            if (missing.length === 0) return true;
+            const lines = missing
+              .map((name) => '    <uses-permission android:name="' + name + '"' + (name.endsWith('READ_EXTERNAL_STORAGE') ? ' android:maxSdkVersion="32"' : '') + ' />')
+              .join('\n');
+            xml = xml.replace(/(<manifest\b[^>]*>)/, '$1\n' + lines);
+            fs.writeFileSync(file, xml);
+            console.log('MYAPPS_PERMISSIONS_MANIFEST ' + JSON.stringify(missing));
+            return true;
+          }
+          
+          function patchAndroidBridge(needsBridge) {
+            if (!needsBridge) return true;
+            const root = 'wrapper/android/app/src/main/java';
+            const found = [];
+            (function walk(dir) {
+              if (!fs.existsSync(dir)) return;
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) walk(full);
+                else if (entry.name === 'MainActivity.java') found.push(full);
+              }
+            })(root);
+            if (found.length === 0) {
+              warn('The Android wrapper has no MainActivity, so the notification prompt was skipped.');
+              return false;
+            }
+            const activity = found[0];
+            const folder = path.dirname(activity);
+            const source = fs.readFileSync(activity, 'utf8');
+            const packageName = (source.match(/^\s*package\s+([\w.]+)\s*;/m) || [])[1];
+            if (!packageName) {
+              warn('The Android MainActivity has no package name, so the notification prompt was skipped.');
+              return false;
+            }
+          
+            const bridge = [
+              'package ' + packageName + ';',
+              '',
+              '/** Asks the device for a declared capability only when a page needs it. */',
+              'public class MyAppsPermissions {',
+              '  private final android.app.Activity activity;',
+              '',
+              '  public MyAppsPermissions(android.app.Activity activity) {',
+              '    this.activity = activity;',
+              '  }',
+              '',
+              '  @android.webkit.JavascriptInterface',
+              '  public void requestPush() {',
+              '    request("push");',
+              '  }',
+              '',
+              '  @android.webkit.JavascriptInterface',
+              '  public void request(String name) {',
+              '    String permission = permissionFor(name);',
+              '    if (permission == null) return;',
+              '    if (android.os.Build.VERSION.SDK_INT < 23) return;',
+              '    try {',
+              '      if (activity.checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED) return;',
+              '      activity.requestPermissions(new String[] { permission }, 4711);',
+              '    } catch (Exception error) {',
+              '      // A device that cannot ask simply keeps the app running without it.',
+              '    }',
+              '  }',
+              '',
+              '  private static String permissionFor(String name) {',
+              '    if ("push".equals(name)) {',
+              '      return android.os.Build.VERSION.SDK_INT >= 33 ? "android.permission.POST_NOTIFICATIONS" : null;',
+              '    }',
+              '    if ("camera".equals(name)) return android.Manifest.permission.CAMERA;',
+              '    if ("microphone".equals(name)) return android.Manifest.permission.RECORD_AUDIO;',
+              '    if ("location".equals(name)) return android.Manifest.permission.ACCESS_FINE_LOCATION;',
+              '    return null;',
+              '  }',
+              '}',
+              '',
+            ].join('\n');
+            fs.writeFileSync(path.join(folder, 'MyAppsPermissions.java'), bridge);
+          
+            const MARKER = 'MYAPPS_PERMISSIONS_BRIDGE';
+            if (!source.includes(MARKER)) {
+              const setup = [
+                '    // ' + MARKER + ': the page asks for a capability only when it needs one.',
+                '    if (getBridge() != null && getBridge().getWebView() != null) {',
+                '      getBridge().getWebView().addJavascriptInterface(new MyAppsPermissions(this), "MyAppsPermissionsBridge");',
+                '    }',
+              ].join('\n');
+              if (!/super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;/.test(source)) {
+                warn('The Android MainActivity has no onCreate to extend, so the notification prompt was skipped.');
+                return false;
+              }
+              fs.writeFileSync(activity, source.replace(/(super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;)/, '$1\n' + setup));
+            }
+            console.log('MYAPPS_PERMISSIONS_ANDROID ' + JSON.stringify({ activity, bridge: true }));
+            return true;
+          }
+          
+          function patchPlist(entries) {
+            const file = 'wrapper/ios/App/App/Info.plist';
+            if (!fs.existsSync(file)) {
+              warn('The iOS Info.plist is missing, so usage descriptions could not be declared.');
+              return false;
+            }
+            let xml = fs.readFileSync(file, 'utf8');
+            const missing = entries.filter(([key]) => !xml.includes('<key>' + key + '</key>'));
+            if (missing.length === 0) return true;
+            const block = missing.map(([key, text]) => '  <key>' + key + '</key>\n  <string>' + text + '</string>').join('\n');
+            xml = xml.replace(/<\/dict>\s*<\/plist>\s*$/, block + '\n</dict>\n</plist>\n');
+            fs.writeFileSync(file, xml);
+            console.log('MYAPPS_PERMISSIONS_PLIST ' + JSON.stringify(missing.map(([key]) => key)));
+            return true;
+          }
+          
+          if (target === 'ios') {
+            const entries = permissions.filter((key) => IOS[key]).map((key) => IOS[key]);
+            if (entries.length === 0) {
+              console.log('MYAPPS_PERMISSIONS_NONE');
+            } else {
+              patchPlist(entries);
+            }
+            // Push on iOS also needs an APNs key and the aps-environment entitlement.
+            if (permissions.indexOf('push') !== -1) {
+              console.log('::notice::Push delivery on iOS needs your APNs key configured for the bundle id.');
+            }
+          } else {
+            const names = [];
+            permissions.forEach((key) => (ANDROID[key] || []).forEach((name) => names.indexOf(name) === -1 && names.push(name)));
+            if (names.length === 0) {
+              console.log('MYAPPS_PERMISSIONS_NONE');
+            } else {
+              patchManifest(names);
+            }
+            patchAndroidBridge(permissions.indexOf('push') !== -1);
+          }
+          MYAPPS_SCRIPT
+          mkdir -p wrapper/www
+          if [ -f wrapper/www/myapps-browser.js ]; then cat /tmp/myapps-permissions-enabled.js /tmp/myapps-permissions-runtime.js >> wrapper/www/myapps-browser.js; else cat /tmp/myapps-permissions-enabled.js /tmp/myapps-permissions-runtime.js > wrapper/www/myapps-browser.js; fi
+          node /tmp/myapps-permissions.cjs
+          (cd wrapper && npx cap copy "$TARGET")
+          echo "The app declares its permissions and asks for them at runtime."
+
       - name: Compile the APK
         working-directory: wrapper/android
         run: ./gradlew assembleDebug --no-daemon
@@ -2906,6 +3165,265 @@ jobs:
           MYAPPS_SCRIPT
           node /tmp/myapps-native-browser.cjs "$TARGET"
           (cd wrapper && npx cap copy "$TARGET")
+
+      - name: Apply the app permissions
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform||"android"')
+          if [ "$PLATFORM" = "ios" ]; then TARGET=ios; else TARGET=android; fi
+          ENABLED=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); JSON.stringify(Array.isArray(c.permissions)?c.permissions:[])')
+          if [ "$ENABLED" = "[]" ]; then echo "No permissions requested for this build."; exit 0; fi
+          echo "Permissions for $TARGET: $ENABLED"
+          printf 'window.__myappsPermissionsEnabled = %s;\n' "$ENABLED" > /tmp/myapps-permissions-enabled.js
+          node -e 'const fs=require("fs");const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{});fs.writeFileSync("/tmp/myapps-permissions.json",JSON.stringify({target:process.argv[1],permissions:Array.isArray(c.permissions)?c.permissions:[]}))' "$TARGET"
+          cat > /tmp/myapps-permissions-runtime.js <<'MYAPPS_SCRIPT'
+          (function () {
+            var enabled = Array.isArray(window.__myappsPermissionsEnabled) ? window.__myappsPermissionsEnabled : [];
+          
+            function allowed(value) {
+              return value === true || value === 'granted';
+            }
+          
+            function askPush() {
+              try {
+                // Android asks through the native bridge; a browser shell can ask itself.
+                if (window.MyAppsPermissionsBridge && window.MyAppsPermissionsBridge.requestPush) {
+                  window.MyAppsPermissionsBridge.requestPush();
+                  return Promise.resolve(true);
+                }
+                if (window.Notification && window.Notification.requestPermission) {
+                  return Promise.resolve(window.Notification.requestPermission()).then(allowed, function () { return false; });
+                }
+              } catch (error) {}
+              return Promise.resolve(false);
+            }
+          
+            function askMedia(constraints) {
+              try {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.resolve(false);
+                return navigator.mediaDevices.getUserMedia(constraints).then(function (stream) {
+                  stream.getTracks().forEach(function (track) { track.stop(); });
+                  return true;
+                }, function () { return false; });
+              } catch (error) {
+                return Promise.resolve(false);
+              }
+            }
+          
+            function askLocation() {
+              try {
+                if (!navigator.geolocation) return Promise.resolve(false);
+                return new Promise(function (resolve) {
+                  navigator.geolocation.getCurrentPosition(
+                    function () { resolve(true); },
+                    function () { resolve(false); },
+                    { timeout: 15000 }
+                  );
+                });
+              } catch (error) {
+                return Promise.resolve(false);
+              }
+            }
+          
+            function request(name) {
+              if (enabled.indexOf(name) === -1) return Promise.resolve(false);
+              if (name === 'push') return askPush();
+              if (name === 'camera') return askMedia({ video: true });
+              if (name === 'microphone') return askMedia({ audio: true });
+              if (name === 'location') return askLocation();
+              // The system asks for library access the first time a file is picked.
+              if (name === 'photos') return Promise.resolve(true);
+              return Promise.resolve(false);
+            }
+          
+            window.MyAppsPermissions = {
+              enabled: enabled,
+              has: function (name) { return enabled.indexOf(name) !== -1; },
+              request: request
+            };
+          
+            // Only notifications are asked for up front; the rest wait for real use.
+            if (enabled.indexOf('push') !== -1) setTimeout(function () { request('push'); }, 1800);
+          })();
+          MYAPPS_SCRIPT
+          cat > /tmp/myapps-permissions.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          
+          const configPath = '/tmp/myapps-permissions.json';
+          const config = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, 'utf8')) : {};
+          const target = config.target === 'ios' ? 'ios' : 'android';
+          const permissions = Array.isArray(config.permissions) ? config.permissions : [];
+          
+          const ANDROID = {
+            push: ['android.permission.POST_NOTIFICATIONS'],
+            camera: ['android.permission.CAMERA'],
+            microphone: ['android.permission.RECORD_AUDIO'],
+            location: ['android.permission.ACCESS_COARSE_LOCATION', 'android.permission.ACCESS_FINE_LOCATION'],
+            photos: ['android.permission.READ_MEDIA_IMAGES', 'android.permission.READ_EXTERNAL_STORAGE'],
+          };
+          
+          const IOS = {
+            camera: ['NSCameraUsageDescription', 'This app uses the camera when you take a photo or scan a document.'],
+            microphone: ['NSMicrophoneUsageDescription', 'This app uses the microphone when you record audio.'],
+            location: ['NSLocationWhenInUseUsageDescription', 'This app uses your location while you are using it.'],
+            photos: ['NSPhotoLibraryUsageDescription', 'This app lets you choose photos from your library.'],
+          };
+          
+          function warn(message) {
+            console.log('::warning::' + message);
+          }
+          
+          function patchManifest(entries) {
+            const file = 'wrapper/android/app/src/main/AndroidManifest.xml';
+            if (!fs.existsSync(file)) {
+              warn('The Android manifest is missing, so permissions could not be declared.');
+              return false;
+            }
+            let xml = fs.readFileSync(file, 'utf8');
+            const missing = entries.filter((name) => !xml.includes('android:name="' + name + '"'));
+            if (missing.length === 0) return true;
+            const lines = missing
+              .map((name) => '    <uses-permission android:name="' + name + '"' + (name.endsWith('READ_EXTERNAL_STORAGE') ? ' android:maxSdkVersion="32"' : '') + ' />')
+              .join('\n');
+            xml = xml.replace(/(<manifest\b[^>]*>)/, '$1\n' + lines);
+            fs.writeFileSync(file, xml);
+            console.log('MYAPPS_PERMISSIONS_MANIFEST ' + JSON.stringify(missing));
+            return true;
+          }
+          
+          function patchAndroidBridge(needsBridge) {
+            if (!needsBridge) return true;
+            const root = 'wrapper/android/app/src/main/java';
+            const found = [];
+            (function walk(dir) {
+              if (!fs.existsSync(dir)) return;
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) walk(full);
+                else if (entry.name === 'MainActivity.java') found.push(full);
+              }
+            })(root);
+            if (found.length === 0) {
+              warn('The Android wrapper has no MainActivity, so the notification prompt was skipped.');
+              return false;
+            }
+            const activity = found[0];
+            const folder = path.dirname(activity);
+            const source = fs.readFileSync(activity, 'utf8');
+            const packageName = (source.match(/^\s*package\s+([\w.]+)\s*;/m) || [])[1];
+            if (!packageName) {
+              warn('The Android MainActivity has no package name, so the notification prompt was skipped.');
+              return false;
+            }
+          
+            const bridge = [
+              'package ' + packageName + ';',
+              '',
+              '/** Asks the device for a declared capability only when a page needs it. */',
+              'public class MyAppsPermissions {',
+              '  private final android.app.Activity activity;',
+              '',
+              '  public MyAppsPermissions(android.app.Activity activity) {',
+              '    this.activity = activity;',
+              '  }',
+              '',
+              '  @android.webkit.JavascriptInterface',
+              '  public void requestPush() {',
+              '    request("push");',
+              '  }',
+              '',
+              '  @android.webkit.JavascriptInterface',
+              '  public void request(String name) {',
+              '    String permission = permissionFor(name);',
+              '    if (permission == null) return;',
+              '    if (android.os.Build.VERSION.SDK_INT < 23) return;',
+              '    try {',
+              '      if (activity.checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED) return;',
+              '      activity.requestPermissions(new String[] { permission }, 4711);',
+              '    } catch (Exception error) {',
+              '      // A device that cannot ask simply keeps the app running without it.',
+              '    }',
+              '  }',
+              '',
+              '  private static String permissionFor(String name) {',
+              '    if ("push".equals(name)) {',
+              '      return android.os.Build.VERSION.SDK_INT >= 33 ? "android.permission.POST_NOTIFICATIONS" : null;',
+              '    }',
+              '    if ("camera".equals(name)) return android.Manifest.permission.CAMERA;',
+              '    if ("microphone".equals(name)) return android.Manifest.permission.RECORD_AUDIO;',
+              '    if ("location".equals(name)) return android.Manifest.permission.ACCESS_FINE_LOCATION;',
+              '    return null;',
+              '  }',
+              '}',
+              '',
+            ].join('\n');
+            fs.writeFileSync(path.join(folder, 'MyAppsPermissions.java'), bridge);
+          
+            const MARKER = 'MYAPPS_PERMISSIONS_BRIDGE';
+            if (!source.includes(MARKER)) {
+              const setup = [
+                '    // ' + MARKER + ': the page asks for a capability only when it needs one.',
+                '    if (getBridge() != null && getBridge().getWebView() != null) {',
+                '      getBridge().getWebView().addJavascriptInterface(new MyAppsPermissions(this), "MyAppsPermissionsBridge");',
+                '    }',
+              ].join('\n');
+              if (!/super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;/.test(source)) {
+                warn('The Android MainActivity has no onCreate to extend, so the notification prompt was skipped.');
+                return false;
+              }
+              fs.writeFileSync(activity, source.replace(/(super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;)/, '$1\n' + setup));
+            }
+            console.log('MYAPPS_PERMISSIONS_ANDROID ' + JSON.stringify({ activity, bridge: true }));
+            return true;
+          }
+          
+          function patchPlist(entries) {
+            const file = 'wrapper/ios/App/App/Info.plist';
+            if (!fs.existsSync(file)) {
+              warn('The iOS Info.plist is missing, so usage descriptions could not be declared.');
+              return false;
+            }
+            let xml = fs.readFileSync(file, 'utf8');
+            const missing = entries.filter(([key]) => !xml.includes('<key>' + key + '</key>'));
+            if (missing.length === 0) return true;
+            const block = missing.map(([key, text]) => '  <key>' + key + '</key>\n  <string>' + text + '</string>').join('\n');
+            xml = xml.replace(/<\/dict>\s*<\/plist>\s*$/, block + '\n</dict>\n</plist>\n');
+            fs.writeFileSync(file, xml);
+            console.log('MYAPPS_PERMISSIONS_PLIST ' + JSON.stringify(missing.map(([key]) => key)));
+            return true;
+          }
+          
+          if (target === 'ios') {
+            const entries = permissions.filter((key) => IOS[key]).map((key) => IOS[key]);
+            if (entries.length === 0) {
+              console.log('MYAPPS_PERMISSIONS_NONE');
+            } else {
+              patchPlist(entries);
+            }
+            // Push on iOS also needs an APNs key and the aps-environment entitlement.
+            if (permissions.indexOf('push') !== -1) {
+              console.log('::notice::Push delivery on iOS needs your APNs key configured for the bundle id.');
+            }
+          } else {
+            const names = [];
+            permissions.forEach((key) => (ANDROID[key] || []).forEach((name) => names.indexOf(name) === -1 && names.push(name)));
+            if (names.length === 0) {
+              console.log('MYAPPS_PERMISSIONS_NONE');
+            } else {
+              patchManifest(names);
+            }
+            patchAndroidBridge(permissions.indexOf('push') !== -1);
+          }
+          MYAPPS_SCRIPT
+          mkdir -p wrapper/www
+          if [ -f wrapper/www/myapps-browser.js ]; then cat /tmp/myapps-permissions-enabled.js /tmp/myapps-permissions-runtime.js >> wrapper/www/myapps-browser.js; else cat /tmp/myapps-permissions-enabled.js /tmp/myapps-permissions-runtime.js > wrapper/www/myapps-browser.js; fi
+          node /tmp/myapps-permissions.cjs
+          (cd wrapper && npx cap copy "$TARGET")
+          echo "The app declares its permissions and asks for them at runtime."
 
       - name: Compile and sign the iOS app
         env:
