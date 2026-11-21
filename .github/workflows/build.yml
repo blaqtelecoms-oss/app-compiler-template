@@ -1621,10 +1621,13 @@ jobs:
           ENABLED=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); JSON.stringify(Array.isArray(c.permissions)?c.permissions:[])')
           if [ "$ENABLED" = "[]" ]; then echo "No permissions requested for this build."; exit 0; fi
           echo "Permissions for $TARGET: $ENABLED"
-          printf 'window.__myappsPermissionsEnabled = %s;\n' "$ENABLED" > /tmp/myapps-permissions-enabled.js
+          node -e 'const fs=require("fs");const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{});const enabled=Array.isArray(c.permissions)?c.permissions:[];const version=String(c.version_name||"")+"+"+String(c.version_code||"");fs.writeFileSync("/tmp/myapps-permissions-enabled.js","window.__myappsPermissionsEnabled = "+JSON.stringify(enabled)+";\nwindow.__myappsPermissionsVersion = "+JSON.stringify(version)+";\n")'
           node -e 'const fs=require("fs");const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{});fs.writeFileSync("/tmp/myapps-permissions.json",JSON.stringify({target:process.argv[1],permissions:Array.isArray(c.permissions)?c.permissions:[]}))' "$TARGET"
           cat > /tmp/myapps-permissions-runtime.js <<'MYAPPS_SCRIPT'
           (function () {
+            if (window.__myappsPermissionsRuntime) return;
+            window.__myappsPermissionsRuntime = true;
+          
             var enabled = Array.isArray(window.__myappsPermissionsEnabled) ? window.__myappsPermissionsEnabled : [];
           
             function allowed(value) {
@@ -1757,14 +1760,19 @@ jobs:
             // opens, so the selection is a real device prompt and not only a line in the
             // manifest. It is asked once per install; a refusal is never repeated.
             var ASKED_KEY = 'myappsPermissionsAsked';
+            // A new build of the app asks once more, so a permission that was refused (or
+            // an app installed over an older build) is offered again on the update.
+            var ASKED_VERSION = String(window.__myappsPermissionsVersion || '1');
             function askedAlready() {
-              try { return window.localStorage.getItem(ASKED_KEY) === '1'; } catch (error) { return false; }
+              try { return window.localStorage.getItem(ASKED_KEY) === ASKED_VERSION; } catch (error) { return false; }
             }
             function markAsked() {
-              try { window.localStorage.setItem(ASKED_KEY, '1'); } catch (error) {}
+              try { window.localStorage.setItem(ASKED_KEY, ASKED_VERSION); } catch (error) {}
             }
             if (enabled.length && !askedAlready()) {
-              setTimeout(function () { markAsked(); requestAll(); }, 1600);
+              // The flag is written only after the device answered, so closing the app
+              // mid-prompt still asks again the next time it opens.
+              setTimeout(function () { requestAll().then(markAsked, markAsked); }, 1600);
             }
           })();
           MYAPPS_SCRIPT
@@ -3563,10 +3571,13 @@ jobs:
           ENABLED=$(node -p 'const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{}); JSON.stringify(Array.isArray(c.permissions)?c.permissions:[])')
           if [ "$ENABLED" = "[]" ]; then echo "No permissions requested for this build."; exit 0; fi
           echo "Permissions for $TARGET: $ENABLED"
-          printf 'window.__myappsPermissionsEnabled = %s;\n' "$ENABLED" > /tmp/myapps-permissions-enabled.js
+          node -e 'const fs=require("fs");const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{});const enabled=Array.isArray(c.permissions)?c.permissions:[];const version=String(c.version_name||"")+"+"+String(c.version_code||"");fs.writeFileSync("/tmp/myapps-permissions-enabled.js","window.__myappsPermissionsEnabled = "+JSON.stringify(enabled)+";\nwindow.__myappsPermissionsVersion = "+JSON.stringify(version)+";\n")'
           node -e 'const fs=require("fs");const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{});fs.writeFileSync("/tmp/myapps-permissions.json",JSON.stringify({target:process.argv[1],permissions:Array.isArray(c.permissions)?c.permissions:[]}))' "$TARGET"
           cat > /tmp/myapps-permissions-runtime.js <<'MYAPPS_SCRIPT'
           (function () {
+            if (window.__myappsPermissionsRuntime) return;
+            window.__myappsPermissionsRuntime = true;
+          
             var enabled = Array.isArray(window.__myappsPermissionsEnabled) ? window.__myappsPermissionsEnabled : [];
           
             function allowed(value) {
@@ -3699,14 +3710,19 @@ jobs:
             // opens, so the selection is a real device prompt and not only a line in the
             // manifest. It is asked once per install; a refusal is never repeated.
             var ASKED_KEY = 'myappsPermissionsAsked';
+            // A new build of the app asks once more, so a permission that was refused (or
+            // an app installed over an older build) is offered again on the update.
+            var ASKED_VERSION = String(window.__myappsPermissionsVersion || '1');
             function askedAlready() {
-              try { return window.localStorage.getItem(ASKED_KEY) === '1'; } catch (error) { return false; }
+              try { return window.localStorage.getItem(ASKED_KEY) === ASKED_VERSION; } catch (error) { return false; }
             }
             function markAsked() {
-              try { window.localStorage.setItem(ASKED_KEY, '1'); } catch (error) {}
+              try { window.localStorage.setItem(ASKED_KEY, ASKED_VERSION); } catch (error) {}
             }
             if (enabled.length && !askedAlready()) {
-              setTimeout(function () { markAsked(); requestAll(); }, 1600);
+              // The flag is written only after the device answered, so closing the app
+              // mid-prompt still asks again the next time it opens.
+              setTimeout(function () { requestAll().then(markAsked, markAsked); }, 1600);
             }
           })();
           MYAPPS_SCRIPT
