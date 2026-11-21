@@ -1631,13 +1631,50 @@ jobs:
               return value === true || value === 'granted';
             }
           
-            function askPush() {
+            function bridge() {
               try {
-                // Android asks through the native bridge; a browser shell can ask itself.
-                if (window.MyAppsPermissionsBridge && window.MyAppsPermissionsBridge.requestPush) {
-                  window.MyAppsPermissionsBridge.requestPush();
-                  return Promise.resolve(true);
-                }
+                return window.MyAppsPermissionsBridge || null;
+              } catch (error) {
+                return null;
+              }
+            }
+          
+            function nativeGranted(name) {
+              var native = bridge();
+              if (!native || typeof native.has !== 'function') return null;
+              try {
+                return native.has(name) === true;
+              } catch (error) {
+                return null;
+              }
+            }
+          
+            // The device dialog pauses the page, so the answer is read back from the app.
+            function waitForGrant(name, timeout) {
+              var started = Date.now();
+              return new Promise(function (resolve) {
+                (function poll() {
+                  if (nativeGranted(name) === true) return resolve(true);
+                  if (Date.now() - started > timeout) return resolve(false);
+                  window.setTimeout(poll, 250);
+                })();
+              });
+            }
+          
+            // Returns null when this build has no native bridge (a plain browser shell).
+            function askNative(name) {
+              var native = bridge();
+              if (!native || typeof native.request !== 'function') return null;
+              try {
+                native.request(name);
+              } catch (error) {
+                return null;
+              }
+              return waitForGrant(name, 15000);
+            }
+          
+            function askPushInPage() {
+              try {
                 if (window.Notification && window.Notification.requestPermission) {
                   return Promise.resolve(window.Notification.requestPermission()).then(allowed, function () { return false; });
                 }
@@ -1645,7 +1682,8 @@ jobs:
               return Promise.resolve(false);
             }
           
-            function askMedia(constraints) {
+            function askMedia(kind) {
+              var constraints = kind === 'camera' ? { video: true } : { audio: true };
               try {
                 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.resolve(false);
                 return navigator.mediaDevices.getUserMedia(constraints).then(function (stream) {
@@ -1674,23 +1712,60 @@ jobs:
           
             function request(name) {
               if (enabled.indexOf(name) === -1) return Promise.resolve(false);
-              if (name === 'push') return askPush();
-              if (name === 'camera') return askMedia({ video: true });
-              if (name === 'microphone') return askMedia({ audio: true });
-              if (name === 'location') return askLocation();
-              // The system asks for library access the first time a file is picked.
-              if (name === 'photos') return Promise.resolve(true);
+              if (name === 'push') {
+                var nativePush = askNative('push');
+                if (!nativePush) return askPushInPage();
+                return nativePush.then(function (granted) {
+                  if (!granted) return false;
+                  // The page's own Notification API is asked too; the app holds it either way.
+                  return askPushInPage().then(function () { return true; });
+                });
+              }
+              if (name === 'camera' || name === 'microphone') {
+                var media = function () { return askMedia(name); };
+                var nativeMedia = askNative(name);
+                return nativeMedia ? nativeMedia.then(function (granted) { return granted ? media() : false; }) : media();
+              }
+              if (name === 'location') {
+                var nativeLocation = askNative('location');
+                return nativeLocation
+                  ? nativeLocation.then(function (granted) { return granted ? askLocation() : false; })
+                  : askLocation();
+              }
+              // The library is read when a file is picked; the device may ask first.
+              if (name === 'photos') return askNative('photos') || Promise.resolve(true);
               return Promise.resolve(false);
+            }
+          
+            /** Every capability this build was configured with, asked for in one pass. */
+            function requestAll() {
+              var order = ['push', 'location', 'photos', 'camera', 'microphone'];
+              var queue = order.filter(function (name) { return enabled.indexOf(name) !== -1; });
+              return queue.reduce(function (chain, name) {
+                return chain.then(function () { return request(name); });
+              }, Promise.resolve(true));
             }
           
             window.MyAppsPermissions = {
               enabled: enabled,
               has: function (name) { return enabled.indexOf(name) !== -1; },
-              request: request
+              request: request,
+              requestAll: requestAll
             };
           
-            // Only notifications are asked for up front; the rest wait for real use.
-            if (enabled.indexOf('push') !== -1) setTimeout(function () { request('push'); }, 1800);
+            // A capability switched on for the app is asked for the first time the app
+            // opens, so the selection is a real device prompt and not only a line in the
+            // manifest. It is asked once per install; a refusal is never repeated.
+            var ASKED_KEY = 'myappsPermissionsAsked';
+            function askedAlready() {
+              try { return window.localStorage.getItem(ASKED_KEY) === '1'; } catch (error) { return false; }
+            }
+            function markAsked() {
+              try { window.localStorage.setItem(ASKED_KEY, '1'); } catch (error) {}
+            }
+            if (enabled.length && !askedAlready()) {
+              setTimeout(function () { markAsked(); requestAll(); }, 1600);
+            }
           })();
           MYAPPS_SCRIPT
           cat > /tmp/myapps-permissions.cjs <<'MYAPPS_SCRIPT'
@@ -1739,7 +1814,10 @@ jobs:
             return true;
           }
           
-          function patchAndroidBridge(needsBridge) {
+          function patchAndroidBridge(permissions) {
+            // Every declared capability needs the bridge: a WebView cannot show the
+            // device dialog for camera, microphone, location or photos on its own.
+            const needsBridge = permissions.some((key) => ANDROID[key] && ANDROID[key].length > 0);
             if (!needsBridge) return true;
             const root = 'wrapper/android/app/src/main/java';
             const found = [];
@@ -1752,7 +1830,7 @@ jobs:
               }
             })(root);
             if (found.length === 0) {
-              warn('The Android wrapper has no MainActivity, so the notification prompt was skipped.');
+              warn('The Android wrapper has no MainActivity, so the permission prompt was skipped.');
               return false;
             }
             const activity = found[0];
@@ -1760,7 +1838,7 @@ jobs:
             const source = fs.readFileSync(activity, 'utf8');
             const packageName = (source.match(/^\s*package\s+([\w.]+)\s*;/m) || [])[1];
             if (!packageName) {
-              warn('The Android MainActivity has no package name, so the notification prompt was skipped.');
+              warn('The Android MainActivity has no package name, so the permission prompt was skipped.');
               return false;
             }
           
@@ -1782,25 +1860,55 @@ jobs:
               '',
               '  @android.webkit.JavascriptInterface',
               '  public void request(String name) {',
-              '    String permission = permissionFor(name);',
-              '    if (permission == null) return;',
               '    if (android.os.Build.VERSION.SDK_INT < 23) return;',
+              '    String[] wanted = permissionsFor(name);',
+              '    if (wanted.length == 0) return;',
+              '    java.util.ArrayList<String> missing = new java.util.ArrayList<String>();',
+              '    for (int i = 0; i < wanted.length; i++) {',
+              '      if (activity.checkSelfPermission(wanted[i]) != android.content.pm.PackageManager.PERMISSION_GRANTED) {',
+              '        missing.add(wanted[i]);',
+              '      }',
+              '    }',
+              '    if (missing.isEmpty()) return;',
               '    try {',
-              '      if (activity.checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED) return;',
-              '      activity.requestPermissions(new String[] { permission }, 4711);',
+              '      activity.requestPermissions(missing.toArray(new String[0]), 4711);',
               '    } catch (Exception error) {',
               '      // A device that cannot ask simply keeps the app running without it.',
               '    }',
               '  }',
               '',
-              '  private static String permissionFor(String name) {',
-              '    if ("push".equals(name)) {',
-              '      return android.os.Build.VERSION.SDK_INT >= 33 ? "android.permission.POST_NOTIFICATIONS" : null;',
+              '  /** True once the device has granted at least one of the capability\'s permissions. */',
+              '  @android.webkit.JavascriptInterface',
+              '  public boolean has(String name) {',
+              '    if (android.os.Build.VERSION.SDK_INT < 23) return true;',
+              '    String[] wanted = permissionsFor(name);',
+              '    if (wanted.length == 0) return true;',
+              '    for (int i = 0; i < wanted.length; i++) {',
+              '      if (activity.checkSelfPermission(wanted[i]) == android.content.pm.PackageManager.PERMISSION_GRANTED) return true;',
               '    }',
-              '    if ("camera".equals(name)) return android.Manifest.permission.CAMERA;',
-              '    if ("microphone".equals(name)) return android.Manifest.permission.RECORD_AUDIO;',
-              '    if ("location".equals(name)) return android.Manifest.permission.ACCESS_FINE_LOCATION;',
-              '    return null;',
+              '    return false;',
+              '  }',
+              '',
+              '  private static String[] permissionsFor(String name) {',
+              '    if ("push".equals(name)) {',
+              '      return android.os.Build.VERSION.SDK_INT >= 33',
+              '        ? new String[] { "android.permission.POST_NOTIFICATIONS" }',
+              '        : new String[0];',
+              '    }',
+              '    if ("camera".equals(name)) return new String[] { android.Manifest.permission.CAMERA };',
+              '    if ("microphone".equals(name)) return new String[] { android.Manifest.permission.RECORD_AUDIO };',
+              '    if ("location".equals(name)) {',
+              '      return new String[] {',
+              '        android.Manifest.permission.ACCESS_FINE_LOCATION,',
+              '        android.Manifest.permission.ACCESS_COARSE_LOCATION',
+              '      };',
+              '    }',
+              '    if ("photos".equals(name)) {',
+              '      return android.os.Build.VERSION.SDK_INT >= 33',
+              '        ? new String[] { "android.permission.READ_MEDIA_IMAGES" }',
+              '        : new String[] { android.Manifest.permission.READ_EXTERNAL_STORAGE };',
+              '    }',
+              '    return new String[0];',
               '  }',
               '}',
               '',
@@ -1816,7 +1924,7 @@ jobs:
                 '    }',
               ].join('\n');
               if (!/super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;/.test(source)) {
-                warn('The Android MainActivity has no onCreate to extend, so the notification prompt was skipped.');
+                warn('The Android MainActivity has no onCreate to extend, so the permission prompt was skipped.');
                 return false;
               }
               fs.writeFileSync(activity, source.replace(/(super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;)/, '$1\n' + setup));
@@ -1860,7 +1968,7 @@ jobs:
             } else {
               patchManifest(names);
             }
-            patchAndroidBridge(permissions.indexOf('push') !== -1);
+            patchAndroidBridge(permissions);
           }
           MYAPPS_SCRIPT
           mkdir -p wrapper/www
@@ -1868,6 +1976,219 @@ jobs:
           node /tmp/myapps-permissions.cjs
           (cd wrapper && npx cap copy "$TARGET")
           echo "The app declares its permissions and asks for them at runtime."
+
+      - name: Add the bottom navigation tabs
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform||"android"')
+          if [ "$PLATFORM" = "ios" ]; then TARGET=ios; else TARGET=android; fi
+          rm -f /tmp/myapps-nav-config.js
+          node -e 'const fs=require("fs");const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{});const ICONS=["home","search","cart","user","grid","heart","globe","calendar","bell","star","phone","menu"];const route=(v)=>{const r=String(v==null?"":v).trim();if(!r)return "/";if(r.charAt(0)==="#")return r;try{const u=new URL(r,"https://app.local");const p=u.pathname.replace(/\/{2,}/g,"/")||"/";return (p.charAt(0)==="/"?p:"/"+p)+u.hash;}catch(e){return "/";}};const tabs=(Array.isArray(c.nav_items)?c.nav_items:[]).map(i=>({label:String(i&&i.label||"").trim().slice(0,24),url:route(i&&i.url),icon:ICONS.indexOf(i&&i.icon)>=0?i.icon:"globe"})).filter(i=>i.label).slice(0,5);if(!tabs.length)process.exit(0);fs.writeFileSync("/tmp/myapps-nav-config.js","window.__myappsNavItems = "+JSON.stringify(tabs)+";\nwindow.__myappsNavTheme = "+JSON.stringify(String(c.theme_color||"#4F46E5"))+";\n")'
+          if [ ! -s /tmp/myapps-nav-config.js ]; then echo "No bottom tabs configured for this build."; exit 0; fi
+          cat > /tmp/myapps-nav-runtime.js <<'MYAPPS_SCRIPT'
+          (function () {
+            if (window.__myappsBottomNav) return;
+            window.__myappsBottomNav = true;
+          
+            var MAX_TABS = 5;
+            var BAR_ID = 'myapps-bottom-nav';
+          
+            // Simple stroke icons, so a tab never depends on the wrapped site's icon font.
+            var ICONS = {
+              home: '<path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v10h13V10"/>',
+              search: '<circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/>',
+              cart: '<path d="M3 4h2.5l2.5 11h10.5l2-8H7"/><circle cx="9.5" cy="19" r="1.4"/><circle cx="17.5" cy="19" r="1.4"/>',
+              user: '<circle cx="12" cy="8" r="3.8"/><path d="M4.5 20c1.6-3.6 4.2-5.4 7.5-5.4S18 16.4 19.5 20"/>',
+              grid: '<rect x="4" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.4"/>',
+              heart: '<path d="M12 20s-7.5-4.6-7.5-9.4A4.1 4.1 0 0 1 12 7.4a4.1 4.1 0 0 1 7.5 3.2C19.5 15.4 12 20 12 20Z"/>',
+              globe: '<circle cx="12" cy="12" r="8"/><path d="M4 12h16"/><path d="M12 4c2.4 2.4 3.6 5 3.6 8s-1.2 5.6-3.6 8c-2.4-2.4-3.6-5-3.6-8S9.6 6.4 12 4Z"/>',
+              calendar: '<rect x="4" y="6" width="16" height="14" rx="2"/><path d="M4 10h16M8 4v4M16 4v4"/>',
+              bell: '<path d="M6 16.5V11a6 6 0 1 1 12 0v5.5l1.5 2H4.5l1.5-2Z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>',
+              star: '<path d="m12 4 2.5 5.3 5.5.8-4 3.9 1 5.6-5-2.9-5 2.9 1-5.6-4-3.9 5.5-.8L12 4Z"/>',
+              phone: '<path d="M6 4h3l1.5 4-2 1.5a11 11 0 0 0 6 6l1.5-2 4 1.5v3a2 2 0 0 1-2.2 2A16 16 0 0 1 4 6.2 2 2 0 0 1 6 4Z"/>',
+              menu: '<path d="M4 7h16M4 12h16M4 17h16"/>'
+            };
+          
+            function escapeHtml(value) {
+              return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+            }
+          
+            /** Only tabs with a label are drawn, in the order they were configured. */
+            function tabs() {
+              var items = Array.isArray(window.__myappsNavItems) ? window.__myappsNavItems : [];
+              return items
+                .filter(function (item) { return item && String(item.label || '').trim(); })
+                .slice(0, MAX_TABS)
+                .map(function (item) {
+                  return {
+                    label: String(item.label).trim().slice(0, 24),
+                    url: String(item.url || '').trim(),
+                    icon: String(item.icon || 'globe')
+                  };
+                });
+            }
+          
+            function absolute(url) {
+              try {
+                return new URL(url || '/', window.location.origin).href;
+              } catch (error) {
+                return window.location.origin + '/';
+              }
+            }
+          
+            function pathOf(url) {
+              var raw = String(url || '').trim();
+              // A hash route (#/shop) is matched against the address itself.
+              if (raw.charAt(0) === '#') return raw;
+              try {
+                return new URL(raw || '/', window.location.origin).pathname.replace(/\/+$/, '') || '/';
+              } catch (error) {
+                return '/';
+              }
+            }
+          
+            /** The deepest configured path the current page sits under wins. */
+            function activeTab(list) {
+              var here = window.location.pathname.replace(/\/+$/, '') || '/';
+              var hash = window.location.hash || '';
+              var best = -1;
+              var bestLength = -1;
+              for (var i = 0; i < list.length; i++) {
+                var target = pathOf(list[i].url);
+                if (target.charAt(0) === '#') {
+                  if (hash === target && target.length > bestLength) {
+                    bestLength = target.length;
+                    best = i;
+                  }
+                  continue;
+                }
+                if (target === '/') continue;
+                if (here === target || here.indexOf(target + '/') === 0) {
+                  if (target.length > bestLength) {
+                    bestLength = target.length;
+                    best = i;
+                  }
+                }
+              }
+              if (best >= 0) return best;
+              for (var j = 0; j < list.length; j++) if (pathOf(list[j].url) === '/') return j;
+              return list.length ? 0 : -1;
+            }
+          
+            function barStyle() {
+              return [
+                'position:fixed',
+                'left:0',
+                'right:0',
+                'bottom:0',
+                'z-index:2147483000',
+                'display:flex',
+                'align-items:stretch',
+                'background:#ffffff',
+                'border-top:1px solid rgba(15,23,42,0.12)',
+                'box-shadow:0 -6px 18px -12px rgba(15,23,42,0.45)',
+                'padding:6px 4px calc(6px + env(safe-area-inset-bottom,0px))',
+                'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif'
+              ].join(';');
+            }
+          
+            function tabStyle(color) {
+              return [
+                'flex:1 1 0',
+                'min-width:0',
+                'display:flex',
+                'flex-direction:column',
+                'align-items:center',
+                'gap:2px',
+                'padding:4px 2px',
+                'text-decoration:none',
+                'background:none',
+                'border:0',
+                'cursor:pointer',
+                '-webkit-tap-highlight-color:transparent',
+                'color:' + color
+              ].join(';');
+            }
+          
+            function render() {
+              var list = tabs();
+              var existing = document.getElementById(BAR_ID);
+              if (!list.length) {
+                if (existing) existing.parentNode.removeChild(existing);
+                return;
+              }
+              var theme = String(window.__myappsNavTheme || '#4F46E5');
+              var active = activeTab(list);
+              var bar = existing;
+              if (!bar) {
+                bar = document.createElement('nav');
+                bar.id = BAR_ID;
+                bar.setAttribute('aria-label', 'App navigation');
+                bar.style.cssText = barStyle();
+                (document.body || document.documentElement).appendChild(bar);
+              }
+              var markup = '';
+              for (var i = 0; i < list.length; i++) {
+                var item = list[i];
+                var color = i === active ? theme : '#8A93A3';
+                markup +=
+                  '<a href="' + escapeHtml(absolute(item.url)) + '" data-myapps-tab="' + i + '" style="' + tabStyle(color) + '">' +
+                  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="' + escapeHtml(color) + '" ' +
+                  'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+                  (ICONS[item.icon] || ICONS.globe) +
+                  '</svg>' +
+                  '<span style="font-size:10.5px;font-weight:600;line-height:1.1;max-width:100%;overflow:hidden;' +
+                  'text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(item.label) + '</span>' +
+                  '</a>';
+              }
+              bar.innerHTML = markup;
+              // Keep the site's own content clear of the bar.
+              var height = bar.getBoundingClientRect ? bar.getBoundingClientRect().height : 0;
+              if (document.body) document.body.style.paddingBottom = Math.round(height || 56) + 'px';
+            }
+          
+            // A single-page site changes the address without a page load, so the active
+            // tab is refreshed whenever history changes.
+            ['pushState', 'replaceState'].forEach(function (name) {
+              var original = window.history && window.history[name];
+              if (typeof original !== 'function') return;
+              window.history[name] = function () {
+                var result = original.apply(this, arguments);
+                window.setTimeout(render, 0);
+                return result;
+              };
+            });
+            window.addEventListener('popstate', render);
+            window.addEventListener('pageshow', render);
+            window.addEventListener('hashchange', render);
+          
+            // A site that re-renders its whole page takes the bar with it, so the bar is
+            // drawn again as soon as it goes missing.
+            if (window.MutationObserver && document.body) {
+              new window.MutationObserver(function () {
+                if (!document.getElementById(BAR_ID) && tabs().length) render();
+              }).observe(document.body, { childList: true });
+            }
+          
+            if (document.readyState === 'loading') {
+              document.addEventListener('DOMContentLoaded', render);
+            } else {
+              render();
+            }
+          })();
+          MYAPPS_SCRIPT
+          mkdir -p wrapper/www
+          if [ -f wrapper/www/myapps-browser.js ]; then cat /tmp/myapps-nav-config.js /tmp/myapps-nav-runtime.js >> wrapper/www/myapps-browser.js; else cat /tmp/myapps-nav-config.js /tmp/myapps-nav-runtime.js > wrapper/www/myapps-browser.js; fi
+          (cd wrapper && npx cap copy "$TARGET")
+          echo "The app shows the configured bottom tabs."
 
       - name: Compile the APK
         working-directory: wrapper/android
@@ -1887,6 +2208,57 @@ jobs:
             --out app.apk /tmp/app-aligned.apk
           "$APKSIGNER" verify --print-certs app.apk | head -6
 
+      - name: Verify the installer before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "INSTALL_ERROR=$1" >> "$GITHUB_ENV"
+            echo "::error::$1"
+            exit 1
+          }
+          cat > /tmp/myapps-check-apk.cjs <<'MYAPPS_SCRIPT'
+          const fs = require('fs');
+          
+          const ERROR_FILE = '/tmp/myapps-apk-error';
+          
+          function fail(message) {
+            fs.writeFileSync(ERROR_FILE, message);
+            process.exit(1);
+          }
+          
+          if (!fs.existsSync('app.apk')) {
+            fail('The compiler produced no app.apk, so there is nothing to install.');
+          }
+          
+          const buffer = fs.readFileSync('app.apk');
+          if (buffer.subarray(0, 2).toString() !== 'PK') {
+            fail('app.apk is not an APK archive, so a phone cannot install it.');
+          }
+          if (!buffer.includes(Buffer.from('AndroidManifest.xml'))) {
+            fail('app.apk has no AndroidManifest.xml, so Android cannot install it.');
+          }
+          if (!buffer.includes(Buffer.from('classes.dex'))) {
+            fail('app.apk has no app code, so it would not start after installing.');
+          }
+          if (!buffer.includes(Buffer.from('APK Sig Block 42')) && !buffer.includes(Buffer.from('META-INF/ANDROIDD'))) {
+            fail('app.apk carries no signature, so Android will refuse to install it.');
+          }
+          console.log('app.apk is a complete, signed APK archive');
+          MYAPPS_SCRIPT
+          if [ ! -s app.apk ]; then
+            fail "The compiler produced no app.apk, so there is nothing to install."
+          fi
+          node /tmp/myapps-check-apk.cjs || fail "$(cat /tmp/myapps-apk-error)"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+          APKSIGNER=$(ls -1 "$SDK"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
+            echo "::warning::apksigner was not found, so the signature could not be checked."
+          elif ! "$APKSIGNER" verify app.apk; then
+            fail "app.apk is not correctly signed, so Android will refuse to install it."
+          fi
+          echo "The installer is a valid, signed APK ready to download."
+
       - name: Publish the APK as a public release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1894,6 +2266,20 @@ jobs:
         run: |
           gh release create "build-$BUILD_ID" app.apk --title "Build $BUILD_ID" --notes "Compiled by MyApps Convertor" >/dev/null || gh release upload "build-$BUILD_ID" app.apk --clobber
           echo "APK_URL=https://github.com/${{ github.repository }}/releases/download/build-$BUILD_ID/app.apk" >> "$GITHUB_ENV"
+
+      - name: Check the published download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+        run: |
+          set -euo pipefail
+          SIZE=$(gh release view "build-$BUILD_ID" --json assets --jq '.assets[] | select(.name=="app.apk") | .size' | head -1)
+          if [ -z "$SIZE" ] || [ "$SIZE" -lt 100000 ]; then
+            echo "INSTALL_ERROR=The release has no usable app.apk, so the download link would not install." >> "$GITHUB_ENV"
+            echo "::error::The release has no usable app.apk, so the download link would not install."
+            exit 1
+          fi
+          echo "The download link serves app.apk ($SIZE bytes)."
 
       - name: Tell MyApps the build succeeded
         if: success()
@@ -1917,7 +2303,7 @@ jobs:
           curl -sS -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
             -H "x-webhook-secret: $WEBHOOK_SECRET" \
-            -d "{\"secret\":\"$WEBHOOK_SECRET\",\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"message\":\"The compiler runner failed - open the Actions log for this run.\"}"
+            -d "$(node -e 'console.log(JSON.stringify({secret:process.env.WEBHOOK_SECRET,build_id:process.env.BUILD_ID,status:"failed",message:process.env.INSTALL_ERROR||"The compiler runner failed - open the Actions log for this run."}))')"
 
   ios:
     if: github.event.client_payload.platform == 'ios'
@@ -3187,13 +3573,50 @@ jobs:
               return value === true || value === 'granted';
             }
           
-            function askPush() {
+            function bridge() {
               try {
-                // Android asks through the native bridge; a browser shell can ask itself.
-                if (window.MyAppsPermissionsBridge && window.MyAppsPermissionsBridge.requestPush) {
-                  window.MyAppsPermissionsBridge.requestPush();
-                  return Promise.resolve(true);
-                }
+                return window.MyAppsPermissionsBridge || null;
+              } catch (error) {
+                return null;
+              }
+            }
+          
+            function nativeGranted(name) {
+              var native = bridge();
+              if (!native || typeof native.has !== 'function') return null;
+              try {
+                return native.has(name) === true;
+              } catch (error) {
+                return null;
+              }
+            }
+          
+            // The device dialog pauses the page, so the answer is read back from the app.
+            function waitForGrant(name, timeout) {
+              var started = Date.now();
+              return new Promise(function (resolve) {
+                (function poll() {
+                  if (nativeGranted(name) === true) return resolve(true);
+                  if (Date.now() - started > timeout) return resolve(false);
+                  window.setTimeout(poll, 250);
+                })();
+              });
+            }
+          
+            // Returns null when this build has no native bridge (a plain browser shell).
+            function askNative(name) {
+              var native = bridge();
+              if (!native || typeof native.request !== 'function') return null;
+              try {
+                native.request(name);
+              } catch (error) {
+                return null;
+              }
+              return waitForGrant(name, 15000);
+            }
+          
+            function askPushInPage() {
+              try {
                 if (window.Notification && window.Notification.requestPermission) {
                   return Promise.resolve(window.Notification.requestPermission()).then(allowed, function () { return false; });
                 }
@@ -3201,7 +3624,8 @@ jobs:
               return Promise.resolve(false);
             }
           
-            function askMedia(constraints) {
+            function askMedia(kind) {
+              var constraints = kind === 'camera' ? { video: true } : { audio: true };
               try {
                 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.resolve(false);
                 return navigator.mediaDevices.getUserMedia(constraints).then(function (stream) {
@@ -3230,23 +3654,60 @@ jobs:
           
             function request(name) {
               if (enabled.indexOf(name) === -1) return Promise.resolve(false);
-              if (name === 'push') return askPush();
-              if (name === 'camera') return askMedia({ video: true });
-              if (name === 'microphone') return askMedia({ audio: true });
-              if (name === 'location') return askLocation();
-              // The system asks for library access the first time a file is picked.
-              if (name === 'photos') return Promise.resolve(true);
+              if (name === 'push') {
+                var nativePush = askNative('push');
+                if (!nativePush) return askPushInPage();
+                return nativePush.then(function (granted) {
+                  if (!granted) return false;
+                  // The page's own Notification API is asked too; the app holds it either way.
+                  return askPushInPage().then(function () { return true; });
+                });
+              }
+              if (name === 'camera' || name === 'microphone') {
+                var media = function () { return askMedia(name); };
+                var nativeMedia = askNative(name);
+                return nativeMedia ? nativeMedia.then(function (granted) { return granted ? media() : false; }) : media();
+              }
+              if (name === 'location') {
+                var nativeLocation = askNative('location');
+                return nativeLocation
+                  ? nativeLocation.then(function (granted) { return granted ? askLocation() : false; })
+                  : askLocation();
+              }
+              // The library is read when a file is picked; the device may ask first.
+              if (name === 'photos') return askNative('photos') || Promise.resolve(true);
               return Promise.resolve(false);
+            }
+          
+            /** Every capability this build was configured with, asked for in one pass. */
+            function requestAll() {
+              var order = ['push', 'location', 'photos', 'camera', 'microphone'];
+              var queue = order.filter(function (name) { return enabled.indexOf(name) !== -1; });
+              return queue.reduce(function (chain, name) {
+                return chain.then(function () { return request(name); });
+              }, Promise.resolve(true));
             }
           
             window.MyAppsPermissions = {
               enabled: enabled,
               has: function (name) { return enabled.indexOf(name) !== -1; },
-              request: request
+              request: request,
+              requestAll: requestAll
             };
           
-            // Only notifications are asked for up front; the rest wait for real use.
-            if (enabled.indexOf('push') !== -1) setTimeout(function () { request('push'); }, 1800);
+            // A capability switched on for the app is asked for the first time the app
+            // opens, so the selection is a real device prompt and not only a line in the
+            // manifest. It is asked once per install; a refusal is never repeated.
+            var ASKED_KEY = 'myappsPermissionsAsked';
+            function askedAlready() {
+              try { return window.localStorage.getItem(ASKED_KEY) === '1'; } catch (error) { return false; }
+            }
+            function markAsked() {
+              try { window.localStorage.setItem(ASKED_KEY, '1'); } catch (error) {}
+            }
+            if (enabled.length && !askedAlready()) {
+              setTimeout(function () { markAsked(); requestAll(); }, 1600);
+            }
           })();
           MYAPPS_SCRIPT
           cat > /tmp/myapps-permissions.cjs <<'MYAPPS_SCRIPT'
@@ -3295,7 +3756,10 @@ jobs:
             return true;
           }
           
-          function patchAndroidBridge(needsBridge) {
+          function patchAndroidBridge(permissions) {
+            // Every declared capability needs the bridge: a WebView cannot show the
+            // device dialog for camera, microphone, location or photos on its own.
+            const needsBridge = permissions.some((key) => ANDROID[key] && ANDROID[key].length > 0);
             if (!needsBridge) return true;
             const root = 'wrapper/android/app/src/main/java';
             const found = [];
@@ -3308,7 +3772,7 @@ jobs:
               }
             })(root);
             if (found.length === 0) {
-              warn('The Android wrapper has no MainActivity, so the notification prompt was skipped.');
+              warn('The Android wrapper has no MainActivity, so the permission prompt was skipped.');
               return false;
             }
             const activity = found[0];
@@ -3316,7 +3780,7 @@ jobs:
             const source = fs.readFileSync(activity, 'utf8');
             const packageName = (source.match(/^\s*package\s+([\w.]+)\s*;/m) || [])[1];
             if (!packageName) {
-              warn('The Android MainActivity has no package name, so the notification prompt was skipped.');
+              warn('The Android MainActivity has no package name, so the permission prompt was skipped.');
               return false;
             }
           
@@ -3338,25 +3802,55 @@ jobs:
               '',
               '  @android.webkit.JavascriptInterface',
               '  public void request(String name) {',
-              '    String permission = permissionFor(name);',
-              '    if (permission == null) return;',
               '    if (android.os.Build.VERSION.SDK_INT < 23) return;',
+              '    String[] wanted = permissionsFor(name);',
+              '    if (wanted.length == 0) return;',
+              '    java.util.ArrayList<String> missing = new java.util.ArrayList<String>();',
+              '    for (int i = 0; i < wanted.length; i++) {',
+              '      if (activity.checkSelfPermission(wanted[i]) != android.content.pm.PackageManager.PERMISSION_GRANTED) {',
+              '        missing.add(wanted[i]);',
+              '      }',
+              '    }',
+              '    if (missing.isEmpty()) return;',
               '    try {',
-              '      if (activity.checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED) return;',
-              '      activity.requestPermissions(new String[] { permission }, 4711);',
+              '      activity.requestPermissions(missing.toArray(new String[0]), 4711);',
               '    } catch (Exception error) {',
               '      // A device that cannot ask simply keeps the app running without it.',
               '    }',
               '  }',
               '',
-              '  private static String permissionFor(String name) {',
-              '    if ("push".equals(name)) {',
-              '      return android.os.Build.VERSION.SDK_INT >= 33 ? "android.permission.POST_NOTIFICATIONS" : null;',
+              '  /** True once the device has granted at least one of the capability\'s permissions. */',
+              '  @android.webkit.JavascriptInterface',
+              '  public boolean has(String name) {',
+              '    if (android.os.Build.VERSION.SDK_INT < 23) return true;',
+              '    String[] wanted = permissionsFor(name);',
+              '    if (wanted.length == 0) return true;',
+              '    for (int i = 0; i < wanted.length; i++) {',
+              '      if (activity.checkSelfPermission(wanted[i]) == android.content.pm.PackageManager.PERMISSION_GRANTED) return true;',
               '    }',
-              '    if ("camera".equals(name)) return android.Manifest.permission.CAMERA;',
-              '    if ("microphone".equals(name)) return android.Manifest.permission.RECORD_AUDIO;',
-              '    if ("location".equals(name)) return android.Manifest.permission.ACCESS_FINE_LOCATION;',
-              '    return null;',
+              '    return false;',
+              '  }',
+              '',
+              '  private static String[] permissionsFor(String name) {',
+              '    if ("push".equals(name)) {',
+              '      return android.os.Build.VERSION.SDK_INT >= 33',
+              '        ? new String[] { "android.permission.POST_NOTIFICATIONS" }',
+              '        : new String[0];',
+              '    }',
+              '    if ("camera".equals(name)) return new String[] { android.Manifest.permission.CAMERA };',
+              '    if ("microphone".equals(name)) return new String[] { android.Manifest.permission.RECORD_AUDIO };',
+              '    if ("location".equals(name)) {',
+              '      return new String[] {',
+              '        android.Manifest.permission.ACCESS_FINE_LOCATION,',
+              '        android.Manifest.permission.ACCESS_COARSE_LOCATION',
+              '      };',
+              '    }',
+              '    if ("photos".equals(name)) {',
+              '      return android.os.Build.VERSION.SDK_INT >= 33',
+              '        ? new String[] { "android.permission.READ_MEDIA_IMAGES" }',
+              '        : new String[] { android.Manifest.permission.READ_EXTERNAL_STORAGE };',
+              '    }',
+              '    return new String[0];',
               '  }',
               '}',
               '',
@@ -3372,7 +3866,7 @@ jobs:
                 '    }',
               ].join('\n');
               if (!/super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;/.test(source)) {
-                warn('The Android MainActivity has no onCreate to extend, so the notification prompt was skipped.');
+                warn('The Android MainActivity has no onCreate to extend, so the permission prompt was skipped.');
                 return false;
               }
               fs.writeFileSync(activity, source.replace(/(super\.onCreate\s*\(\s*savedInstanceState\s*\)\s*;)/, '$1\n' + setup));
@@ -3416,7 +3910,7 @@ jobs:
             } else {
               patchManifest(names);
             }
-            patchAndroidBridge(permissions.indexOf('push') !== -1);
+            patchAndroidBridge(permissions);
           }
           MYAPPS_SCRIPT
           mkdir -p wrapper/www
@@ -3424,6 +3918,219 @@ jobs:
           node /tmp/myapps-permissions.cjs
           (cd wrapper && npx cap copy "$TARGET")
           echo "The app declares its permissions and asks for them at runtime."
+
+      - name: Add the bottom navigation tabs
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          PLATFORM=$(node -p 'JSON.parse(process.env.PAYLOAD||"{}").platform||"android"')
+          if [ "$PLATFORM" = "ios" ]; then TARGET=ios; else TARGET=android; fi
+          rm -f /tmp/myapps-nav-config.js
+          node -e 'const fs=require("fs");const c=(JSON.parse(process.env.PAYLOAD||"{}").app_config||{});const ICONS=["home","search","cart","user","grid","heart","globe","calendar","bell","star","phone","menu"];const route=(v)=>{const r=String(v==null?"":v).trim();if(!r)return "/";if(r.charAt(0)==="#")return r;try{const u=new URL(r,"https://app.local");const p=u.pathname.replace(/\/{2,}/g,"/")||"/";return (p.charAt(0)==="/"?p:"/"+p)+u.hash;}catch(e){return "/";}};const tabs=(Array.isArray(c.nav_items)?c.nav_items:[]).map(i=>({label:String(i&&i.label||"").trim().slice(0,24),url:route(i&&i.url),icon:ICONS.indexOf(i&&i.icon)>=0?i.icon:"globe"})).filter(i=>i.label).slice(0,5);if(!tabs.length)process.exit(0);fs.writeFileSync("/tmp/myapps-nav-config.js","window.__myappsNavItems = "+JSON.stringify(tabs)+";\nwindow.__myappsNavTheme = "+JSON.stringify(String(c.theme_color||"#4F46E5"))+";\n")'
+          if [ ! -s /tmp/myapps-nav-config.js ]; then echo "No bottom tabs configured for this build."; exit 0; fi
+          cat > /tmp/myapps-nav-runtime.js <<'MYAPPS_SCRIPT'
+          (function () {
+            if (window.__myappsBottomNav) return;
+            window.__myappsBottomNav = true;
+          
+            var MAX_TABS = 5;
+            var BAR_ID = 'myapps-bottom-nav';
+          
+            // Simple stroke icons, so a tab never depends on the wrapped site's icon font.
+            var ICONS = {
+              home: '<path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v10h13V10"/>',
+              search: '<circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/>',
+              cart: '<path d="M3 4h2.5l2.5 11h10.5l2-8H7"/><circle cx="9.5" cy="19" r="1.4"/><circle cx="17.5" cy="19" r="1.4"/>',
+              user: '<circle cx="12" cy="8" r="3.8"/><path d="M4.5 20c1.6-3.6 4.2-5.4 7.5-5.4S18 16.4 19.5 20"/>',
+              grid: '<rect x="4" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.4"/>',
+              heart: '<path d="M12 20s-7.5-4.6-7.5-9.4A4.1 4.1 0 0 1 12 7.4a4.1 4.1 0 0 1 7.5 3.2C19.5 15.4 12 20 12 20Z"/>',
+              globe: '<circle cx="12" cy="12" r="8"/><path d="M4 12h16"/><path d="M12 4c2.4 2.4 3.6 5 3.6 8s-1.2 5.6-3.6 8c-2.4-2.4-3.6-5-3.6-8S9.6 6.4 12 4Z"/>',
+              calendar: '<rect x="4" y="6" width="16" height="14" rx="2"/><path d="M4 10h16M8 4v4M16 4v4"/>',
+              bell: '<path d="M6 16.5V11a6 6 0 1 1 12 0v5.5l1.5 2H4.5l1.5-2Z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>',
+              star: '<path d="m12 4 2.5 5.3 5.5.8-4 3.9 1 5.6-5-2.9-5 2.9 1-5.6-4-3.9 5.5-.8L12 4Z"/>',
+              phone: '<path d="M6 4h3l1.5 4-2 1.5a11 11 0 0 0 6 6l1.5-2 4 1.5v3a2 2 0 0 1-2.2 2A16 16 0 0 1 4 6.2 2 2 0 0 1 6 4Z"/>',
+              menu: '<path d="M4 7h16M4 12h16M4 17h16"/>'
+            };
+          
+            function escapeHtml(value) {
+              return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+            }
+          
+            /** Only tabs with a label are drawn, in the order they were configured. */
+            function tabs() {
+              var items = Array.isArray(window.__myappsNavItems) ? window.__myappsNavItems : [];
+              return items
+                .filter(function (item) { return item && String(item.label || '').trim(); })
+                .slice(0, MAX_TABS)
+                .map(function (item) {
+                  return {
+                    label: String(item.label).trim().slice(0, 24),
+                    url: String(item.url || '').trim(),
+                    icon: String(item.icon || 'globe')
+                  };
+                });
+            }
+          
+            function absolute(url) {
+              try {
+                return new URL(url || '/', window.location.origin).href;
+              } catch (error) {
+                return window.location.origin + '/';
+              }
+            }
+          
+            function pathOf(url) {
+              var raw = String(url || '').trim();
+              // A hash route (#/shop) is matched against the address itself.
+              if (raw.charAt(0) === '#') return raw;
+              try {
+                return new URL(raw || '/', window.location.origin).pathname.replace(/\/+$/, '') || '/';
+              } catch (error) {
+                return '/';
+              }
+            }
+          
+            /** The deepest configured path the current page sits under wins. */
+            function activeTab(list) {
+              var here = window.location.pathname.replace(/\/+$/, '') || '/';
+              var hash = window.location.hash || '';
+              var best = -1;
+              var bestLength = -1;
+              for (var i = 0; i < list.length; i++) {
+                var target = pathOf(list[i].url);
+                if (target.charAt(0) === '#') {
+                  if (hash === target && target.length > bestLength) {
+                    bestLength = target.length;
+                    best = i;
+                  }
+                  continue;
+                }
+                if (target === '/') continue;
+                if (here === target || here.indexOf(target + '/') === 0) {
+                  if (target.length > bestLength) {
+                    bestLength = target.length;
+                    best = i;
+                  }
+                }
+              }
+              if (best >= 0) return best;
+              for (var j = 0; j < list.length; j++) if (pathOf(list[j].url) === '/') return j;
+              return list.length ? 0 : -1;
+            }
+          
+            function barStyle() {
+              return [
+                'position:fixed',
+                'left:0',
+                'right:0',
+                'bottom:0',
+                'z-index:2147483000',
+                'display:flex',
+                'align-items:stretch',
+                'background:#ffffff',
+                'border-top:1px solid rgba(15,23,42,0.12)',
+                'box-shadow:0 -6px 18px -12px rgba(15,23,42,0.45)',
+                'padding:6px 4px calc(6px + env(safe-area-inset-bottom,0px))',
+                'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif'
+              ].join(';');
+            }
+          
+            function tabStyle(color) {
+              return [
+                'flex:1 1 0',
+                'min-width:0',
+                'display:flex',
+                'flex-direction:column',
+                'align-items:center',
+                'gap:2px',
+                'padding:4px 2px',
+                'text-decoration:none',
+                'background:none',
+                'border:0',
+                'cursor:pointer',
+                '-webkit-tap-highlight-color:transparent',
+                'color:' + color
+              ].join(';');
+            }
+          
+            function render() {
+              var list = tabs();
+              var existing = document.getElementById(BAR_ID);
+              if (!list.length) {
+                if (existing) existing.parentNode.removeChild(existing);
+                return;
+              }
+              var theme = String(window.__myappsNavTheme || '#4F46E5');
+              var active = activeTab(list);
+              var bar = existing;
+              if (!bar) {
+                bar = document.createElement('nav');
+                bar.id = BAR_ID;
+                bar.setAttribute('aria-label', 'App navigation');
+                bar.style.cssText = barStyle();
+                (document.body || document.documentElement).appendChild(bar);
+              }
+              var markup = '';
+              for (var i = 0; i < list.length; i++) {
+                var item = list[i];
+                var color = i === active ? theme : '#8A93A3';
+                markup +=
+                  '<a href="' + escapeHtml(absolute(item.url)) + '" data-myapps-tab="' + i + '" style="' + tabStyle(color) + '">' +
+                  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="' + escapeHtml(color) + '" ' +
+                  'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+                  (ICONS[item.icon] || ICONS.globe) +
+                  '</svg>' +
+                  '<span style="font-size:10.5px;font-weight:600;line-height:1.1;max-width:100%;overflow:hidden;' +
+                  'text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(item.label) + '</span>' +
+                  '</a>';
+              }
+              bar.innerHTML = markup;
+              // Keep the site's own content clear of the bar.
+              var height = bar.getBoundingClientRect ? bar.getBoundingClientRect().height : 0;
+              if (document.body) document.body.style.paddingBottom = Math.round(height || 56) + 'px';
+            }
+          
+            // A single-page site changes the address without a page load, so the active
+            // tab is refreshed whenever history changes.
+            ['pushState', 'replaceState'].forEach(function (name) {
+              var original = window.history && window.history[name];
+              if (typeof original !== 'function') return;
+              window.history[name] = function () {
+                var result = original.apply(this, arguments);
+                window.setTimeout(render, 0);
+                return result;
+              };
+            });
+            window.addEventListener('popstate', render);
+            window.addEventListener('pageshow', render);
+            window.addEventListener('hashchange', render);
+          
+            // A site that re-renders its whole page takes the bar with it, so the bar is
+            // drawn again as soon as it goes missing.
+            if (window.MutationObserver && document.body) {
+              new window.MutationObserver(function () {
+                if (!document.getElementById(BAR_ID) && tabs().length) render();
+              }).observe(document.body, { childList: true });
+            }
+          
+            if (document.readyState === 'loading') {
+              document.addEventListener('DOMContentLoaded', render);
+            } else {
+              render();
+            }
+          })();
+          MYAPPS_SCRIPT
+          mkdir -p wrapper/www
+          if [ -f wrapper/www/myapps-browser.js ]; then cat /tmp/myapps-nav-config.js /tmp/myapps-nav-runtime.js >> wrapper/www/myapps-browser.js; else cat /tmp/myapps-nav-config.js /tmp/myapps-nav-runtime.js > wrapper/www/myapps-browser.js; fi
+          (cd wrapper && npx cap copy "$TARGET")
+          echo "The app shows the configured bottom tabs."
 
       - name: Compile and sign the iOS app
         env:
